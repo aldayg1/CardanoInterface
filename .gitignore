@@ -1,0 +1,23 @@
+# Python / uv
+.venv/
+__pycache__/
+.mypy_cache/
+.ruff_cache/
+*.pyc
+
+# Secrets — encrypted user data and wallet keys must never be committed
+CardanoInterface/users/
+CardanoInterface/wallets/
+
+# Runtime artifacts
+debug_main.log
+last_update_check.txt
+
+# Captured TUI sessions — these transcripts contain typed 24-word recovery
+# phrases and wallet passwords in plaintext. Never commit them.
+audit/logs/
+audit/tmp/
+audit/results/
+
+# Fixture credentials, kept on the operator's machine only
+CREDENTIALS.local.md

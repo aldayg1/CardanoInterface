@@ -1,0 +1,75 @@
+[project]
+name = "cardano-interface"
+version = "0.1.0"
+description = "Local Cardano wallet interface with Ogmios/Kupo backends"
+requires-python = ">=3.11"
+dependencies = [
+    "pycardano",
+    "mnemonic",
+    "cryptography",
+    "rich",
+    "prompt_toolkit",
+    "requests",
+    "pynacl",
+    # pycardano 0.18 defaults to its cbor2pure code path, which re-imports
+    # 5.x exception names (e.g. CBORDecodeValueError) from cbor2; cbor2 6.x
+    # removed them. Keep cbor2 on 5.x until pycardano supports 6.x.
+    "cbor2<6",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.0",
+    "ruff>=0.16.3",
+]
+
+[tool.uv]
+# Single-file script app: dependencies are managed by uv (uv sync / uv add)
+# and executed with `uv run CardanoInterface.py`; the project itself is not
+# built or installed as a package.
+package = false
+# Always use a uv-managed CPython (auto-downloaded), never a system/PATH
+# interpreter — the environment is fully reproducible from uv.lock alone.
+python-preference = "only-managed"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+# === Strictness beyond vanilla --strict ===
+check_untyped_defs = true
+disallow_any_unimported = true
+disallow_any_expr = true
+disallow_subclassing_any = true
+warn_unreachable = true
+disallow_any_decorated = true
+ignore_missing_imports = false
+show_error_code_links = true
+disallow_any_explicit = true
+strict_equality = true
+pretty = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unused_configs = true
+show_error_codes = true
+show_column_numbers = true
+# No per-module ignore_missing_imports overrides: every dependency either
+# ships type information (mnemonic, cryptography, rich, prompt_toolkit,
+# requests, pynacl) or carries inline annotations that this flag makes mypy
+# actually use (pycardano). That gives the whole dependency surface real
+# types instead of module-Any, so disallow_any_expr polices every boundary.
+follow_untyped_imports = true
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# CardanoInterface.py bootstraps logging + a log-file writability check BEFORE
+# the heavy imports (rich/pycardano/...) so import failures are captured in
+# debug_main.log — the file's stated design. Those bootstrap statements must
+# run first, so every subsequent import necessarily sits below module-level
+# code. E402 is ignored for this reason and this reason only.
+"CardanoInterface.py" = ["E402"]
