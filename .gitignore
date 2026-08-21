@@ -21,3 +21,16 @@ audit/results/
 
 # Fixture credentials, kept on the operator's machine only
 CREDENTIALS.local.md
+
+# Agent / dev tooling — not part of CardanoInterface
+.agents/
+.claude/
+.opencode/
+.zcode/
+AGENTS.md
+CLAUDE.md
+BACKLOG.md
+MULTISIG_SPEC.md
+draft/
+audit/
+.python-version
