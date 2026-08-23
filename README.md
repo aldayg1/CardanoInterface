@@ -1,3 +1,5 @@
+**Date:** 08/23/26
+
 # CardanoInterface
 
 Local Cardano wallet interface with Ogmios/Kupo or Blockfrost backends. Single-file Python TUI app for creating, managing, and spending from wallets — including native multisig (N-of-M) wallets with CBOR export/import.
