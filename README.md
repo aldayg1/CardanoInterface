@@ -2,7 +2,7 @@
 
 # CardanoInterface
 
-Local Cardano wallet interface with Ogmios/Kupo or Blockfrost backends. Single-file Python TUI app for creating, managing, and spending from wallets — including native multisig (N-of-M) wallets with CBOR export/import.
+Local Cardano wallet interface with Ogmios/Kupo, Blockfrost, or Koios backends. Single-file Python TUI app for creating, managing, and spending from wallets — including native multisig (N-of-M) wallets with CBOR export/import.
 
 ## Requirements
 
@@ -10,6 +10,7 @@ Local Cardano wallet interface with Ogmios/Kupo or Blockfrost backends. Single-f
 - **[uv](https://docs.astral.sh/uv/getting-started/installation/)** — manages dependencies and runs the app
 - A Cardano backend:
   - **Blockfrost** — remote REST API (needs a [project ID](https://blockfrost.io/))
+  - **Koios** — free public REST API, no key needed
   - **Ogmios + Kupo** — local node bridge (auto-discovers network)
 
 ## Setup
@@ -81,6 +82,7 @@ Type `1`, `2`, or `3`. **Preprod** is recommended for testing.
 Select a backend:
   1. Blockfrost (remote API)
   2. Local Node (Ogmios + Kupo)
+  3. Koios (public API)
 ```
 
 **Option 1 — Blockfrost:**
@@ -92,6 +94,11 @@ Select a backend:
 - Enter Kupo URL (default: `http://localhost:1442`)
 - Kupo is optional — if unreachable, Ogmios handles UTxO queries (slower)
 - The app validates the node's network matches your selection
+
+**Option 3 — Koios:**
+- Connects immediately to the public Koios instance for the selected network
+  (`api.koios.rest` for mainnet, `preprod.koios.rest` / `preview.koios.rest`)
+- No API key needed; reachability is validated on connect
 
 ### Step 4: You're at the Main Menu
 

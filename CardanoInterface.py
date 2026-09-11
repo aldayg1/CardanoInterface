@@ -466,6 +466,14 @@ BLOCKFROST_URLS = {
     "preview": "https://cardano-preview.blockfrost.io",
 }
 
+# Koios' public instances need no API key; the network is in the hostname
+# (https://koios.rest, spec servers list).
+KOIOS_URLS = {
+    "mainnet": "https://api.koios.rest/api/v1",
+    "preprod": "https://preprod.koios.rest/api/v1",
+    "preview": "https://preview.koios.rest/api/v1",
+}
+
 DEFAULT_OGMIOS_PORT = 1337
 DEFAULT_KUPO_PORT = 1442
 
@@ -701,6 +709,186 @@ class BlockfrostBackend(CardanoBackend):
         if not isinstance(slot, int):
             raise NetworkError("Blockfrost returned no slot for the latest block.")
         return slot
+
+class KoiosBackend(CardanoBackend):
+    """The public Koios REST instances (https://koios.rest), no API key.
+
+    Endpoints and field shapes follow the published spec
+    (https://api.koios.rest, koios-artifacts/specs): POST address_utxos,
+    POST submittx (binary CBOR), GET epoch_params, GET tip. The network is
+    fixed by the base URL the instance was configured with, like Blockfrost.
+    """
+
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
+        self._protocol_param: ProtocolParameters | None = None
+
+    def _utxos(self, address: str) -> list[UTxO]:
+        try:
+            resp = requests.post(f"{self.base_url}/address_utxos",
+                                 json={"_addresses": [address]}, timeout=15)
+            if resp.status_code == 404:
+                return []
+            resp.raise_for_status()
+            raw: JSON = resp.json()
+        except _REQUEST_ERROR:
+            logging.error("Failed to fetch UTxOs from Koios", exc_info=True)
+            return []
+        except Exception:
+            logging.error("Error parsing UTxOs from Koios", exc_info=True)
+            return []
+        utxos = []
+        for entry in _json_list(raw):
+            try:
+                u = _json_object(entry)
+                tx_id: TransactionId = TransactionId.from_primitive(u.get("tx_hash"))
+                tx_in = TransactionInput(tx_id, _json_int(u.get("tx_index")))
+                addr: Address = Address.from_primitive(u.get("address"))
+                lovelace_amount = _json_int(u.get("value"))
+                multi_assets: dict[str, dict[str, int]] = {}
+                for item in _json_list(u.get("asset_list")):
+                    a = _json_object(item)
+                    policy_id = _json_str(a.get("policy_id"))
+                    asset_name = _json_str(a.get("asset_name"))
+                    multi_assets.setdefault(policy_id, {})[asset_name] = _json_int(
+                        a.get("quantity"))
+                value = Value(lovelace_amount)
+                if multi_assets:
+                    value.multi_asset = _multi_asset_from_primitive(multi_assets)
+                tx_out = TransactionOutput(addr, value)
+                utxos.append(UTxO(tx_in, tx_out))
+            except Exception:
+                continue
+        return utxos
+
+    def submit_tx_cbor(self, cbor: bytes | str) -> str | None:
+        body = cbor if isinstance(cbor, bytes) else bytes.fromhex(cbor)
+        try:
+            resp = requests.post(f"{self.base_url}/submittx", data=body,
+                                 headers={"Content-Type": "application/cbor"},
+                                 timeout=15)
+        except _REQUEST_ERROR as e:
+            logging.error(f"Failed to submit transaction via Koios: {e}")
+            raise TransactionSubmissionError(str(e)) from e
+        if resp.status_code >= 400:
+            # The body carries the ledger's actual rejection reason; surfacing
+            # it beats a generic HTTP error that hides why the tx was refused.
+            detail = resp.text[:300]
+            raise TransactionSubmissionError(
+                f"Koios rejected the transaction (HTTP {resp.status_code}): {detail}")
+        raw: JSON = resp.json()
+        return raw if isinstance(raw, str) else None
+
+    def health(self) -> dict[str, JSON]:
+        # Koios has no dedicated health endpoint; a tip answer is the health.
+        try:
+            resp = requests.get(f"{self.base_url}/tip", timeout=10)
+            resp.raise_for_status()
+            raw: JSON = resp.json()
+            return {"is_healthy": True, "tip": raw}
+        except Exception as e:
+            return {"is_healthy": False, "error": str(e)}
+
+    @property
+    def protocol_param(self) -> ProtocolParameters:
+        if self._protocol_param is not None:
+            return self._protocol_param
+        try:
+            resp = requests.get(f"{self.base_url}/epoch_params", timeout=15)
+            resp.raise_for_status()
+            raw: JSON = resp.json()
+        except Exception as e:
+            logging.error(f"[protocol_param] Failed to fetch protocol parameters "
+                          f"from Koios: {e}", exc_info=True)
+            console.print(f"[red]Failed to fetch protocol parameters: {e}[/red]")
+            raise
+        entries = _json_list(raw)
+        if not entries:
+            raise NetworkError("Koios returned no epoch parameters.")
+        def _epoch_no_of(e: JSON) -> int:
+            return _json_int(_json_object(e).get("epoch_no"))
+        dict_entries = [e for e in entries if isinstance(e, dict)]
+        params = _json_object(max(dict_entries, key=_epoch_no_of, default={}))
+        try:
+            self._protocol_param = ProtocolParameters(
+                min_fee_constant=_json_int(params.get('min_fee_b'), 155381),
+                min_fee_coefficient=_json_int(params.get('min_fee_a'), 44),
+                max_block_size=_json_int(params.get('max_block_size'), 90112),
+                max_tx_size=_json_int(params.get('max_tx_size'), 16384),
+                max_block_header_size=_json_int(params.get('max_bh_size'), 1100),
+                key_deposit=_json_int(params.get('key_deposit'), 2000000),
+                pool_deposit=_json_int(params.get('pool_deposit'), 500000000),
+                pool_influence=_json_fraction(params.get('influence'), Fraction(0)),
+                monetary_expansion=_json_fraction(
+                    params.get('monetary_expand_rate'), Fraction(0)),
+                treasury_expansion=_json_fraction(
+                    params.get('treasury_growth_rate'), Fraction(0)),
+                decentralization_param=_json_fraction(
+                    params.get('decentralisation'), Fraction(0)),
+                extra_entropy=_json_str(params.get('extra_entropy')),
+                protocol_major_version=_json_int(params.get('protocol_major')),
+                protocol_minor_version=_json_int(params.get('protocol_minor')),
+                min_utxo=_json_int(params.get('min_utxo_value'), 1000000),
+                min_pool_cost=_json_int(params.get('min_pool_cost')),
+                price_mem=_json_fraction(params.get('price_mem'), Fraction("0.0577")),
+                price_step=_json_fraction(params.get('price_step'),
+                                          Fraction("0.0000721")),
+                max_tx_ex_mem=_json_int(params.get('max_tx_ex_mem'), 10000000),
+                max_tx_ex_steps=_json_int(params.get('max_tx_ex_steps'), 10000000000),
+                max_block_ex_mem=_json_int(params.get('max_block_ex_mem'), 50000000),
+                max_block_ex_steps=_json_int(params.get('max_block_ex_steps'),
+                                             40000000000),
+                max_val_size=_json_int(params.get('max_val_size'), 5000),
+                collateral_percent=_json_int(params.get('collateral_percent'), 150),
+                max_collateral_inputs=_json_int(params.get('max_collateral_inputs'), 3),
+                # Koios reports cost models as positional arrays and native-script
+                # transactions never read Plutus cost models; dict-shaped models
+                # pass through, array-shaped ones yield an empty mapping.
+                cost_models=_cost_models_from_json(
+                    {name: {str(i): c for i, c in enumerate(_json_list(ops))}
+                     if isinstance(ops, list) else ops
+                     for name, ops in _json_object(params.get('cost_models')).items()}),
+                coins_per_utxo_word=34482,
+                coins_per_utxo_byte=_json_int(params.get('coins_per_utxo_size'), 4310),
+                maximum_reference_scripts_size={"bytes": _json_int(
+                    params.get('max_ref_script_size'), 16384)},
+                min_fee_reference_scripts={"base": _json_float(
+                    params.get('min_fee_ref_script_cost_per_byte'), 15.0),
+                    "range": 25600.0, "multiplier": 1.2},
+            )
+        except Exception as e:
+            logging.error(f"[protocol_param] Error mapping Koios protocol parameters:"
+                          f" {e}", exc_info=True)
+            console.print(f"[red]Error mapping protocol parameters: {e}[/red]")
+            raise
+        return self._protocol_param
+
+    def display_name(self) -> str:
+        if "api.koios.rest" in self.base_url:
+            return "Koios (Mainnet)"
+        elif "preprod" in self.base_url:
+            return "Koios (Preprod)"
+        elif "preview" in self.base_url:
+            return "Koios (Preview)"
+        return "Koios"
+
+    @property
+    def network(self) -> Network:
+        if "api.koios.rest" in self.base_url:
+            return Network.MAINNET
+        return Network.TESTNET
+
+    @property
+    def last_block_slot(self) -> int:
+        resp = requests.get(f"{self.base_url}/tip", timeout=10)
+        resp.raise_for_status()
+        raw: JSON = resp.json()
+        tip = _json_object(next(iter(_json_list(raw)), {}))
+        slot = tip.get("abs_slot")
+        if not isinstance(slot, int):
+            raise NetworkError("Koios returned no abs_slot for the chain tip.")
+        return slot
+
 
 class KupoBackend(CardanoBackend):
     def __init__(self, url: str, network: str | None = None):
@@ -1487,6 +1675,32 @@ def load_wallet_network(wallet_dir: str) -> str:
             return f.read().strip()
     except FileNotFoundError:
         return ""
+
+def _wallet_network_mismatch(wallet_dir: str) -> str | None:
+    """The wallet's recorded network when it differs from the selected one.
+
+    A script CBOR carries no network, so a multisig wallet's network is what
+    was selected when it was created or recovered, recorded in network.txt.
+    Working on it through a different backend would query another chain at
+    this wallet's address and report an empty wallet as truth — so every door
+    that reads or spends a wallet checks here first. None means compatible
+    (or the network is unrecorded, which older personal wallets may be).
+    """
+    wallet_net = load_wallet_network(wallet_dir)
+    if wallet_net and SELECTED_NETWORK and wallet_net != SELECTED_NETWORK:
+        return wallet_net
+    return None
+
+def _refuse_wrong_network(wallet_name: str, wallet_dir: str, action: str) -> bool:
+    """True when the wallet's network rules out `action` right now, and says so."""
+    mismatch = _wallet_network_mismatch(wallet_dir)
+    if mismatch is None:
+        return False
+    console.print(f"[red]{wallet_name} belongs to {mismatch}, but you are connected "
+                  f"to {SELECTED_NETWORK}. Reading {action} here would report "
+                  "another chain's state at this wallet's address — switch "
+                  f"networks first (Switch Backend, option {mismatch}).[/red]")
+    return True
 
 def flash_banner(text: str, flashes: int = 5, delay: float = 0.3) -> None:
     """Flash a warning banner on the console."""
@@ -5824,6 +6038,14 @@ def scan_multisig_addresses(wallet_dir: str) -> dict[str, JSON]:
     wallet = _load_multisig_wallet(wallet_dir)
     address = wallet["script_address"]
 
+    # A wrong-network query returns an empty UTxO set and would write that
+    # empty result into known_indices as if the wallet were empty. Refuse.
+    if _refuse_wrong_network(os.path.basename(wallet_dir), wallet_dir,
+                             "this wallet's balance"):
+        raise ValueError(
+            f"This wallet belongs to {_wallet_network_mismatch(wallet_dir)}; "
+            f"switch networks to read its balance.")
+
     console.print(f"[bold]Reading balance at[/bold] [cyan]{address}[/cyan]")
 
     utxos = context.utxos(address)
@@ -6178,6 +6400,8 @@ def funds_send() -> None:
             if not os.path.exists(wallet_dir):
                 console.print("[red]Wallet not found. Please create or import the wallet"
                               " first or type 'cancel' to abort.[/red]")
+                continue
+            if _refuse_wrong_network(wallet_name, wallet_dir, "a send"):
                 continue
             break
 
@@ -6571,12 +6795,15 @@ def switch_backend() -> None:
     console.print("[bold]Select a new backend:[/bold]")
     console.print("  1. Blockfrost (remote API)")
     console.print("  2. Local Node (Ogmios + Kupo)")
+    console.print("  3. Koios (public API)")
     choice = session.prompt("> ").strip()
 
     if choice == "1":
         prompt_blockfrost_setup()
     elif choice == "2":
         prompt_local_stack_setup()
+    elif choice == "3":
+        prompt_koios_setup()
     else:
         console.print("[red]Invalid choice.[/red]")
         return
@@ -6609,6 +6836,10 @@ def tracker_lp(current_user: str, user_password: str) -> None:
             continue
         wallet_entry = wallets[int(choice) - 1]
         wallet_name = _wallet_entry_name(wallet_entry)
+        if _refuse_wrong_network(wallet_name,
+                                 secure_path_join(WALLET_DIR, wallet_name),
+                                 "this wallet's assets"):
+            continue
         break
     address = _json_str(_json_object(wallet_entry).get("address"))
     if not address:
@@ -6996,15 +7227,24 @@ def _select_multisig_wallet(current_user: str, user_password: str,
         wallet_dir = secure_path_join(WALLET_DIR, name)
         try:
             info = _load_multisig_wallet(wallet_dir)
-            labels.append(f"{name}  [dim]({info['threshold']} of "
-                          f"{len(info['key_hashes'])} must sign)[/dim]")
+            label = f"{name}  [dim]({info['threshold']} of " \
+                    f"{len(info['key_hashes'])} must sign)[/dim]"
         except Exception:
-            labels.append(name)
+            label = name
+        # Escaped brackets: an unescaped [mainnet] would be parsed as a Rich
+        # style tag and silently vanish from the rendered line.
+        mismatch = _wallet_network_mismatch(wallet_dir)
+        if mismatch is not None:
+            label += f"  [red]\\[{mismatch} — you are on {SELECTED_NETWORK}][/red]"
+        labels.append(label)
 
-    choice = _prompt_choice(title, labels)
-    if choice is None:
-        return None
-    return secure_path_join(WALLET_DIR, names[choice])
+    while True:
+        choice = _prompt_choice(title, labels)
+        if choice is None:
+            return None
+        wallet_dir = secure_path_join(WALLET_DIR, names[choice])
+        if not _refuse_wrong_network(names[choice], wallet_dir, "this wallet"):
+            return wallet_dir
 
 
 def _resolve_signing_wallet(current_user: str, user_password: str,
@@ -7472,6 +7712,16 @@ def _preview_script_before_import(current_user: str, user_password: str,
         console.print(f"  Hash:      {script_hash_bytes.hex()}")
         for candidate_label, address in script_address_candidates(script_hash_bytes).items():
             console.print(f"  Address ({candidate_label}): [cyan]{address}[/cyan]")
+
+    # A script CBOR carries no network; the addresses above are derived for
+    # the network selected this session. The same CBOR is the identity of a
+    # mainnet wallet just as much as a preprod one, so say which chain the
+    # funds probe is about to search — an empty probe on the wrong network
+    # must not read as "this wallet has no funds".
+    console.print(f"[dim]Addresses derived for the "
+                  f"{SELECTED_NETWORK or 'currently selected'} network. If this "
+                  "script is a wallet on another network, switch networks before "
+                  "recovering, or the funds check will find nothing.[/dim]")
 
     # Which of this machine's wallets the script names is the same for every
     # reading in practice (they carry the same key hashes), so it is shown once.
@@ -7996,6 +8246,26 @@ def prompt_blockfrost_setup() -> None:
     context = BlockfrostBackend(BLOCKFROST_BASE_URL, BLOCKFROST_PROJECT_ID)
     console.print(f"[green]Connected to {SELECTED_NETWORK} successfully![/green]")
 
+def prompt_koios_setup() -> None:
+    global context, BACKEND_TYPE
+    base_url = KOIOS_URLS.get(SELECTED_NETWORK or "preprod", KOIOS_URLS["preprod"])
+    console.print(f"[yellow]Connecting to the public Koios {SELECTED_NETWORK} API "
+                  f"({base_url})...[/yellow]")
+    try:
+        koios = KoiosBackend(base_url)
+        health = koios.health()
+        if not health.get("is_healthy"):
+            err = _json_str(health.get("error"), "unknown error")
+            console.print(f"[red]Koios responded but is not healthy: {err}[/red]")
+            return
+    except Exception as e:
+        console.print(f"[red]Cannot connect to Koios at {base_url}: {e}[/red]")
+        return
+    BACKEND_TYPE = "koios"
+    context = koios
+    console.print(f"[green]Connected to the public Koios {SELECTED_NETWORK} "
+                  "successfully![/green]")
+
 def _normalize_local_endpoint(raw: str) -> str:
     """What a person types for a local endpoint, as a URL a backend can call.
 
@@ -8075,13 +8345,16 @@ def prompt_backend_setup() -> None:
         console.print("[bold]Select a backend:[/bold]")
         console.print("  1. Blockfrost (remote API)")
         console.print("  2. Local Node (Ogmios + Kupo)")
+        console.print("  3. Koios (public API)")
         choice = session.prompt("> ").strip()
         if choice == "1":
             prompt_blockfrost_setup()
         elif choice == "2":
             prompt_local_stack_setup()
+        elif choice == "3":
+            prompt_koios_setup()
         else:
-            console.print("[red]Invalid choice. Please enter 1 or 2.[/red]")
+            console.print("[red]Invalid choice. Please enter 1, 2, or 3.[/red]")
 
 def main() -> None:
     logging.debug("[ENTRY] main()")
