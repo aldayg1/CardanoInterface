@@ -34,3 +34,6 @@ MULTISIG_SPEC.md
 draft/
 audit/
 .python-version
+
+# Internal strategy — holds-for-renewal is not public. Never commit.
+PRIVATE_ROADMAP.md

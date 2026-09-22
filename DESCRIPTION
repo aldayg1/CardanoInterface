@@ -1,0 +1,1 @@
+Local, sovereign Cardano wallet interface for recovering and managing funds from sunset wallet providers. Recover multisig wallets from CBOR, build/sign/assemble/submit transactions, delegate stake, and send ADA and native tokens — keys never leave your machine. No hosted services required.

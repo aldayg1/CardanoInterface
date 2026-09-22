@@ -1,19 +1,39 @@
-# You can override the included template(s) by including variable overrides
-# SAST customization: https://docs.gitlab.com/user/application_security/sast/#available-cicd-variables
-# Secret Detection customization: https://docs.gitlab.com/user/application_security/secret_detection/pipeline/configure/
-# Dependency Scanning customization: https://docs.gitlab.com/user/application_security/dependency_scanning/dependency_scanning_sbom/#customizing-analyzer-behavior
-# Container Scanning customization: https://docs.gitlab.com/user/application_security/container_scanning/#customizing-analyzer-behavior
-# Note that environment variables can be set in several places
-# See https://docs.gitlab.com/ci/variables/#cicd-variable-precedence
+# CardanoInterface CI
+# Stages: test (static analysis + SAST) → secret-detection → dependency-scanning
+# The project has no test framework; static analysis (mypy + ruff) is the
+# enforced gate. End-to-end behaviour is validated manually on Preprod.
 stages:
 - test
 - secret-detection
-sast:
-  stage: test
+- dependency-scanning
+
+variables:
+  SECRET_DETECTION_ENABLED: 'true'
+
 include:
 - template: Security/SAST.gitlab-ci.yml
 - template: Security/Secret-Detection.gitlab-ci.yml
-variables:
-  SECRET_DETECTION_ENABLED: 'true'
+- template: Jobs/Dependency-Scanning.gitlab-ci.yml
+
+sast:
+  stage: test
+
 secret_detection:
   stage: secret-detection
+
+test:
+  stage: test
+  image: ghcr.io/astral-sh/uv:0.9.9-python3.12-bookworm-slim
+  cache:
+    key:
+      files:
+      - uv.lock
+    paths:
+    - .venv
+  script:
+  - uv sync --locked --frozen
+  - uv run mypy CardanoInterface.py
+  - uv run ruff check CardanoInterface.py
+  rules:
+  - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'

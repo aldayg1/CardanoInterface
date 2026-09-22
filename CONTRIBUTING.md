@@ -1,0 +1,67 @@
+# Contributing to CardanoInterface
+
+Thank you for your interest in contributing to CardanoInterface. This document explains how to get involved.
+
+## Reporting Bugs
+
+Open an issue on [GitLab](https://gitlab.com/RefracticLabs/cardanointerface/-/issues) with:
+
+- What you were doing when the bug occurred
+- The exact error message or unexpected behavior
+- Your environment: OS, Python version (`python --version`), backend type (Blockfrost/Koios/Ogmios)
+- Steps to reproduce
+
+Do **not** include mnemonics, private keys, passwords, or API keys in any issue.
+
+## Suggesting Features
+
+Open an issue with:
+
+- What problem the feature solves
+- How you envision it working
+- Whether it aligns with the project's goal of being a local, sovereign wallet tool
+
+## Submitting Changes
+
+1. Fork the repository on GitLab
+2. Create a branch from `main` (`git checkout -b feature/my-change`)
+3. Make your changes
+4. Run the checks before submitting:
+   ```bash
+   uv run mypy CardanoInterface.py
+   uv run ruff check CardanoInterface.py
+   ```
+5. Open a merge request with a clear description of what changed and why
+
+## Code Standards
+
+- **No mocks, stubs, or placeholders** in source code. Every function must do what it says it does.
+- **One implementation per concern.** No duplicate functions or parallel code paths.
+- **Integer lovelace for all money values.** Never use floats for ADA amounts.
+- **Research before guessing.** Check PyCardano, CIP-1854, CIP-30, Ogmios, and Kupo documentation before writing code that depends on their behavior.
+- **No hardcoded networks.** Always read from `current_network` or `SELECTED_NETWORK`.
+- **Credentials stay local.** Never log, print, or commit mnemonics, private keys, passwords, or API keys.
+
+## Development Setup
+
+```bash
+git clone https://gitlab.com/RefracticLabs/cardanointerface.git
+cd cardanointerface
+uv sync
+uv run CardanoInterface.py
+```
+
+## Testing
+
+No test framework. Static analysis plus manual testing:
+
+```bash
+uv run mypy CardanoInterface.py
+uv run ruff check CardanoInterface.py
+```
+
+For end-to-end testing, use a Preprod backend with test wallets.
+
+## Security
+
+If you discover a security vulnerability, do **not** open a public issue. See [SECURITY.md](SECURITY.md) for responsible disclosure instructions.
