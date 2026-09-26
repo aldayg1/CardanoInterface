@@ -1,7 +1,9 @@
 # CardanoInterface CI
-# Stages: test (static analysis + SAST) → secret-detection → dependency-scanning
-# The project has no test framework; static analysis (mypy + ruff) is the
-# enforced gate. End-to-end behaviour is validated manually on Preprod.
+# Stages: test (static analysis + compliance + tests + SAST) → secret-detection
+# → dependency-scanning. This file is the reviewer-visible mirror of the
+# operator's local commit gate (audit/ci/, untracked): same checks minus
+# machine-local tooling. End-to-end behaviour is additionally validated on
+# Preprod with the `live` marker (opt-in, never runs here).
 stages:
 - test
 - secret-detection
@@ -13,7 +15,7 @@ variables:
 include:
 - template: Security/SAST.gitlab-ci.yml
 - template: Security/Secret-Detection.gitlab-ci.yml
-- template: Jobs/Dependency-Scanning.gitlab-ci.yml
+- template: Security/Jobs/Dependency-Scanning.gitlab-ci.yml
 
 sast:
   stage: test
@@ -21,8 +23,7 @@ sast:
 secret_detection:
   stage: secret-detection
 
-test:
-  stage: test
+default:
   image: ghcr.io/astral-sh/uv:0.9.9-python3.12-bookworm-slim
   cache:
     key:
@@ -30,6 +31,37 @@ test:
       - uv.lock
     paths:
     - .venv
+
+# Intersect OSC documentation must-haves + claim hygiene + lockfile/SBOM.
+# Mirrors the local commit gate's compliance checks (minus local-only tooling).
+compliance:
+  stage: test
+  script:
+  - uv sync --locked --frozen
+  - >-
+    for req in README.md DESCRIPTION LICENSE CONTRIBUTING.md CODE_OF_CONDUCT.md
+    CODEOWNERS CHANGELOG.md SECURITY.md MAINTAINERS.md ROADMAP.md .gitlab-ci.yml
+    .gitlab/issue_templates/bug.md .gitlab/issue_templates/feature_request.md
+    .gitlab/merge_request_templates/default.md; do
+    test -f "$req" || { echo "OSC must-have missing: $req"; exit 1; }; done
+  - >-
+    if grep -rinE "critical infrastructure|actively used in the ecosystem|widely adopted"
+    --include='*.md' . ; then
+    echo "Overclaim terms in shipped docs are not permitted (usage is not claimable)";
+    exit 1; fi
+  - uv lock --check
+  - uv export --format requirements-txt --output-file requirements.txt
+  artifacts:
+    paths:
+    - requirements.txt
+    expire_in: 30 days
+  rules:
+  - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# Static analysis — the enforced gate (ultra-strict mypy, ruff; zero errors).
+test:
+  stage: test
   script:
   - uv sync --locked --frozen
   - uv run mypy CardanoInterface.py
@@ -37,3 +69,14 @@ test:
   rules:
   - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
   - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# Hermetic test suite (golden-vector probes + recorded integrations).
+# Activates automatically when tests/ lands; L3 live tests are marker-excluded.
+tests:
+  stage: test
+  script:
+  - uv sync --locked --frozen
+  - uv run pytest -m "not live"
+  rules:
+  - exists:
+    - tests/test_*.py
