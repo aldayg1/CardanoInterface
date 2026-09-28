@@ -37,7 +37,7 @@ default:
 compliance:
   stage: test
   script:
-  - uv sync --locked --frozen
+  - uv sync --locked
   - >-
     for req in README.md DESCRIPTION LICENSE CONTRIBUTING.md CODE_OF_CONDUCT.md
     CODEOWNERS CHANGELOG.md SECURITY.md MAINTAINERS.md ROADMAP.md .gitlab-ci.yml
@@ -63,7 +63,7 @@ compliance:
 test:
   stage: test
   script:
-  - uv sync --locked --frozen
+  - uv sync --locked
   - uv run mypy CardanoInterface.py
   - uv run ruff check CardanoInterface.py
   rules:
@@ -75,7 +75,7 @@ test:
 tests:
   stage: test
   script:
-  - uv sync --locked --frozen
+  - uv sync --locked
   - uv run pytest -m "not live"
   rules:
   - exists:
