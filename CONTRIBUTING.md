@@ -53,14 +53,39 @@ uv run CardanoInterface.py
 
 ## Testing
 
-No test framework. Static analysis plus manual testing:
+The suite is hermetic by default — it runs with zero infrastructure (no
+network, no node, no wallets) and must stay that way:
 
 ```bash
+uv sync                      # dev tools + pytest come from the dev group
+uv run pytest -m "not live"  # the hermetic suite (seconds)
 uv run mypy CardanoInterface.py
 uv run ruff check CardanoInterface.py
 ```
 
-For end-to-end testing, use a Preprod backend with test wallets.
+Test layers:
+
+- **L1 golden-vector probes** (`tests/test_money.py`, `tests/test_thresholds.py`,
+  `tests/test_multisig_script.py`) — real functions against externally-sourced
+  expected values (spec documents, cardano-cli cross-validations, on-chain
+  records). Every expectation carries a provenance header citing its oracle.
+- **L2 recorded integration** (planned) — the builder replayed against
+  captured chain responses (stored verbatim, with provenance and a refresh
+  command).
+- **L3 live end-to-end** — marked `live`, skipped by default; requires a
+  Preprod node and test wallets. Run explicitly with `uv run pytest -m live`.
+
+Tests are generated and maintained with `testbuilder/` (see its README):
+each test's expected values trace to a registered oracle in
+`testbuilder/kb/oracles.json`, and every build is recorded with provenance in
+`testbuilder/kb/`. Good first contributions: add a golden vector or extend a
+probe — read `testbuilder/kb/lessons.md` first.
+
+CI runs the hermetic suite on every pipeline; the `live` marker is excluded
+there by design.
+
+For end-to-end validation beyond the suite, use a Preprod backend with test
+wallets.
 
 ## Security
 

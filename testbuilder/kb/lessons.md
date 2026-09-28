@@ -1,0 +1,7 @@
+- 2026-09-26 Binary test material MUST use bytes.fromhex: small models write hex strings as bytes literals (b-quotes = ASCII text, double length, wrong bytes).
+- 2026-09-26 Never assert exact error-message text unless the oracle documents it: message strings are implementation detail. Assert exception type only.
+- 2026-09-26 Library calls must match the API grounding (signatures introspected from the installed venv), never model memory.
+- 2026-09-26 Expected CBOR primitives must be pure python (ints/lists/bytes), not library constructor objects; prefer documented byte-form assertions.
+- 2026-09-26 Rule-derived boundaries must respect domain constraints (a signature threshold of 0 is never a valid script state; floor bounded at 1).
+- 2026-09-27 Call the function under test with its REAL signature (from the source and API grounding), never an invented calling convention: Qwen3-8B passed 'pubkey'/'all' mode strings as a threshold argument and every draft test died on one TypeError.
+- 2026-09-27 Timelock constructors require the slot value: InvalidBefore(before), InvalidHereAfter(after) - Qwen3-8B calls them bare (InvalidBefore()) and the error only surfaces at test runtime; the grounding probe should carry constructor __init__ signatures (it does - the draft must use it).

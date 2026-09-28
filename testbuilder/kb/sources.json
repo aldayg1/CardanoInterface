@@ -1,0 +1,25 @@
+{
+  "preprod_epoch_params": {
+    "name": "preprod_epoch_params",
+    "url": "https://preprod.koios.rest/api/v1/epoch_params",
+    "hash": "9559ca36ebe2fad1",
+    "captured": "2026-09-27",
+    "file": "kb/sources/preprod_epoch_params.9559ca36ebe2fad1.raw",
+    "spec": {
+      "type": "koios",
+      "network": "preprod",
+      "path": "/epoch_params"
+    }
+  },
+  "cip1854_doc": {
+    "name": "cip1854_doc",
+    "url": "https://raw.githubusercontent.com/cardano-foundation/CIPs/master/CIP-1854/README.md",
+    "hash": "4d9dd6b4ddbd0fc9",
+    "captured": "2026-09-27",
+    "file": "kb/sources/cip1854_doc.4d9dd6b4ddbd0fc9.raw",
+    "spec": {
+      "type": "raw",
+      "url": "https://raw.githubusercontent.com/cardano-foundation/CIPs/master/CIP-1854/CIP-1854.md"
+    }
+  }
+}

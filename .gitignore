@@ -37,3 +37,8 @@ audit/
 
 # Internal strategy — holds-for-renewal is not public. Never commit.
 PRIVATE_ROADMAP.md
+
+# Assessment queue — process evidence, not product (full provenance lives in
+# testbuilder/kb/); the composed suite and the KB are the committed artifacts.
+tests/_review/
+testbuilder/kb/last_report.md

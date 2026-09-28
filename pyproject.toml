@@ -21,6 +21,18 @@ dependencies = [
 dev = [
     "mypy>=2.3.0",
     "ruff>=0.16.3",
+    "pytest>=8.0",
+    "langgraph>=0.2",
+    "pyqt6>=6.7",
+]
+
+[tool.pytest.ini_options]
+# The app is a single root-level module (`package = false`); pythonpath makes
+# `from CardanoInterface import ...` work in tests without installing anything.
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+    "live: L3 live end-to-end tests (real preprod node + wallets); deselected by default, run with -m live",
 ]
 
 [tool.uv]
