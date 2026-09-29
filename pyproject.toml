@@ -44,6 +44,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["testbuilder"]
+
+[project.scripts]
+testbuilder = "testbuilder.cli:main"
+
+[tool.uv]
+# The app itself is still executed by path (`uv run CardanoInterface.py`).
 # Always use a uv-managed CPython (auto-downloaded), never a system/PATH
 # interpreter — the environment is fully reproducible from uv.lock alone.
 python-preference = "only-managed"

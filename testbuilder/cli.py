@@ -224,10 +224,36 @@ def _mk_graph(nodes: list[str]) -> StateGraph:
     return g.compile()
 
 
+def _autodetect_paths(repo: str | None, target: str | None) -> tuple[str, str]:
+    """Walk up from the cwd until CardanoInterface.py is found — the builder
+    is repo-tailored and must not need paths typed by hand."""
+    if repo and target:
+        return repo, target
+    here = Path.cwd().resolve()
+    for candidate in (here, *here.parents):
+        if (candidate / "CardanoInterface.py").exists():
+            repo = repo or str(candidate)
+            target = target or str(candidate / "CardanoInterface.py")
+            return repo, target
+    print(
+        "error: could not locate CardanoInterface.py from the current "
+        "directory — cd into the repository, or pass repo and target "
+        "explicitly.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(prog="testbuilder")
-    ap.add_argument("repo", help="target repository root")
-    ap.add_argument("target", help="source file to build tests for")
+    ap = argparse.ArgumentParser(
+        prog="testbuilder",
+        description="Test-suite builder lifecycle CLI. With no action flags, "
+        "opens the interactive lifecycle console.",
+    )
+    ap.add_argument("repo", nargs="?", default=None,
+                    help="target repository root (default: auto-detect)")
+    ap.add_argument("target", nargs="?", default=None,
+                    help="source file to build tests for (default: auto-detect)")
     ap.add_argument("--symbol", action="append", default=[],
                     help="top-level function to target (repeatable; default: all)")
     ap.add_argument("--oracle", action="append", default=[],
@@ -242,6 +268,13 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="with --refresh: only print the staleness scan")
     args = ap.parse_args()
+
+    if not args.refresh and not args.complete \
+            and not args.symbol and not args.oracle:
+        from .tui import main as tui_main
+        return tui_main()
+
+    args.repo, args.target = _autodetect_paths(args.repo, args.target)
 
     signal.signal(signal.SIGTERM, _sigterm_to_cancel)
 
