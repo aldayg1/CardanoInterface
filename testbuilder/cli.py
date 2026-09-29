@@ -23,12 +23,21 @@ Usage:
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+if __package__ in (None, ""):
+    # Invoked as a plain file (uv run python cli.py .. ../CardanoInterface.py)
+    # from any directory: re-dispatch through the package.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import testbuilder.cli as _pkg
+
+    raise SystemExit(_pkg.main())
+
 import argparse
 import json
 import signal
-import sys
 from datetime import UTC, datetime
-from pathlib import Path
 
 from langgraph.graph import END, StateGraph
 
@@ -235,11 +244,15 @@ def main() -> int:
     args = ap.parse_args()
 
     signal.signal(signal.SIGTERM, _sigterm_to_cancel)
-    try:
-        ensure_vllm_up()
-    except VLLMUnavailable as down:
-        print(f"vLLM UNAVAILABLE: {down}", file=sys.stderr)
-        return 75  # EX_TEMPFAIL: temporary infrastructure failure, retryable
+
+    # A --dry-run staleness scan is pure DB/files: the model server is not
+    # part of that contract and must not gate it.
+    if not (args.refresh and args.dry_run):
+        try:
+            ensure_vllm_up()
+        except VLLMUnavailable as down:
+            print(f"vLLM UNAVAILABLE: {down}", file=sys.stderr)
+            return 75  # EX_TEMPFAIL: temporary infrastructure failure
 
     if args.refresh:
         return _refresh(args, dry=args.dry_run)

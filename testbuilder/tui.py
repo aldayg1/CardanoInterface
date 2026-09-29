@@ -21,6 +21,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+if __package__ in (None, ""):
+    # Invoked as a plain file (uv run python tui.py) from any directory:
+    # re-dispatch through the package so relative imports resolve.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import testbuilder.tui as _pkg
+
+    raise SystemExit(_pkg.main())
+
 from prompt_toolkit import PromptSession
 from rich.console import Console
 from rich.panel import Panel

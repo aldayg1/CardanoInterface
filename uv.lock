@@ -146,7 +146,7 @@ wheels = [
 [[package]]
 name = "cardano-interface"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "cbor2" },
     { name = "cryptography" },
