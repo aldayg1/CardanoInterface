@@ -2974,13 +2974,11 @@ def _pick_own_cosigner_key(current_user: str,
 
     candidates = _read_cosigner_key_hash_cache(wallet_dir)
     if not candidates:
-        console.print(f"[bold]Enter the password for '{wallet_name}':[/bold]")
-        password = prompt_existing_password()
-        try:
-            candidates = _wallet_cosigner_key_hashes(wallet_dir, password)
-        except Exception as e:
-            console.print(f"[red]Could not open that wallet: {e}[/red]")
+        verified = _prompt_wallet_password(wallet_name, wallet_dir,
+                                           _wallet_cosigner_key_hashes)
+        if verified is None:
             return None
+        candidates = verified[1]
 
     # Both standards are derivable from the same wallet. For a script this
     # program creates, the personal-wallet path is the one its own signing flow
@@ -3020,6 +3018,29 @@ def _remember_cosigner_key_hash(wallet_dir: str, path_label: str,
         logging.warning(f"Could not cache cosigner key hash for {wallet_dir}: {e}")
 
 
+def _prompt_wallet_password(wallet_name: str, wallet_dir: str,
+                            verify: Callable[[str, str], R]) -> tuple[str, R] | None:
+    """Ask for a wallet's password until it actually opens the wallet.
+
+    A mistyped password is the most common thing to go wrong in any wallet
+    door, and it is entirely recoverable — so every door re-asks here instead
+    of throwing the user back to the menu with a decryption error (one wrong
+    keystroke used to kill the whole Send Funds flow, 2026-09-30). `verify` is
+    the cheapest decryption the door needs anyway; a password that decrypts one
+    file of a wallet decrypts them all, and the verified result comes back so
+    the caller never decrypts the same file twice. None means the user gave up.
+    """
+    while True:
+        console.print(f"[bold]Enter the password for '{wallet_name}':[/bold]")
+        password = prompt_existing_password()
+        try:
+            return password, verify(wallet_dir, password)
+        except Exception:
+            console.print(f"[red]That password did not open '{wallet_name}'.[/red]")
+            console.print("[bold]Try again? (y/n)[/bold]")
+            if not _prompt_yes_no(default=True):
+                return None
+
 def _prompt_wallet_unlock(current_user: str,
                           user_password: str) -> tuple[str, str, str] | None:
     """Pick one of this user's wallets and unlock it with its password.
@@ -3042,17 +3063,11 @@ def _prompt_wallet_unlock(current_user: str,
     if choice is None:
         return None
     wallet_name, wallet_dir = entries[choice]
-    while True:
-        console.print(f"[bold]Enter the password for '{wallet_name}':[/bold]")
-        password = prompt_existing_password()
-        try:
-            load_encrypted_mnemonic(wallet_dir, password)
-            return wallet_name, wallet_dir, password
-        except Exception:
-            console.print(f"[red]That password did not open '{wallet_name}'.[/red]")
-            console.print("[bold]Try again? (y/n)[/bold]")
-            if not _prompt_yes_no(default=True):
-                return None
+    verified = _prompt_wallet_password(wallet_name, wallet_dir,
+                                       load_encrypted_mnemonic)
+    if verified is None:
+        return None
+    return wallet_name, wallet_dir, verified[0]
 
 
 def _prompt_threshold_percentage(num_cosigners: int) -> int | None:
@@ -6366,20 +6381,17 @@ def show_mnemonic(current_user: str, user_password: str) -> None:
                 else:
                     console.print("[red]Please answer 'yes' or 'no'.[/red]")
         else:
-            console.print("[bold]Enter your password to decrypt the mnemonic:[/bold]")
-            password = prompt_existing_password()
-            try:
-                mnemonic = load_encrypted_mnemonic(wallet_dir, password)
-                logging.debug(f"[DEBUG-show_mnemonic] Decrypted mnemonic for"
-                              f" wallet '{wallet_name}'.")
-                console.print("[bold green]Your wallet's 24-word mnemonic passphrase:[/bold green]")
-                console.print(f"[yellow]{mnemonic}[/yellow]")
-                console.print("[bold red]Store this mnemonic securely!"
-                              " Anyone with it can access your funds.[/bold red]")
-            except Exception as e:
-                logging.error(f"[DEBUG-show_mnemonic-ERROR] Failed to decrypt"
-                              f" mnemonic: {e}", exc_info=True)
-                console.print(f"[red]Failed to decrypt mnemonic: {e}[/red]")
+            verified = _prompt_wallet_password(wallet_name, wallet_dir,
+                                               load_encrypted_mnemonic)
+            if verified is None:
+                return
+            mnemonic = verified[1]
+            logging.debug(f"[DEBUG-show_mnemonic] Decrypted mnemonic for"
+                          f" wallet '{wallet_name}'.")
+            console.print("[bold green]Your wallet's 24-word mnemonic passphrase:[/bold green]")
+            console.print(f"[yellow]{mnemonic}[/yellow]")
+            console.print("[bold red]Store this mnemonic securely!"
+                          " Anyone with it can access your funds.[/bold red]")
     except Exception as e:
         logging.error(f"[DEBUG-show_mnemonic-ERROR] Failed to load wallets: {e}", exc_info=True)
         console.print(f"[red]Failed to load wallets: {e}[/red]")
@@ -6413,9 +6425,14 @@ def funds_send() -> None:
 
         # The asset picker lists what this wallet actually holds, which needs
         # its address — and the address is encrypted, so the password comes
-        # here rather than at the very end.
-        password = prompt_existing_password()
-        sender_address_str = load_encrypted_address(wallet_dir, password)
+        # here rather than at the very end. A mistyped one is re-asked: on
+        # 2026-09-30 a single wrong keystroke aborted the whole send.
+        verified = _prompt_wallet_password(wallet_name, wallet_dir,
+                                           load_encrypted_address)
+        if verified is None:
+            console.print("[yellow]Send funds cancelled.[/yellow]")
+            return
+        password, sender_address_str = verified
 
         selection = _prompt_send_selection(sender_address_str)
         if selection is None:
@@ -7876,10 +7893,17 @@ def _interactive_export_wallet_checkpoint(current_user: str, user_password: str)
             console.print("[dim]because anyone could otherwise write themselves into "
                           "the file.[/dim]")
             if _prompt_yes_no(default=True):
-                signer_wallet_dir = ours[0]["wallet_dir"]
-                console.print(f"[bold]Enter the password for "
-                              f"'{ours[0]['wallet_name']}':[/bold]")
-                password = prompt_existing_password()
+                signer = ours[0]
+                verified = _prompt_wallet_password(
+                    signer["wallet_name"], signer["wallet_dir"],
+                    load_encrypted_mnemonic)
+                if verified is None:
+                    console.print("[yellow]The checkpoint will export unsigned, so "
+                                  "copies restored from it have no "
+                                  "administrator.[/yellow]")
+                else:
+                    signer_wallet_dir = signer["wallet_dir"]
+                    password = verified[0]
         else:
             console.print(f"\n[yellow]This wallet's administrator is cosigner "
                           f"{admin_index + 1}, whose key is not on this "
@@ -8090,13 +8114,11 @@ def show_my_cosigner_key(current_user: str, user_password: str) -> None:
 
     candidates = _read_cosigner_key_hash_cache(wallet_dir)
     if not candidates:
-        console.print(f"[bold]Enter the password for '{wallet_name}':[/bold]")
-        password = prompt_existing_password()
-        try:
-            candidates = _wallet_cosigner_key_hashes(wallet_dir, password)
-        except Exception as e:
-            console.print(f"[red]Could not open that wallet: {e}[/red]")
+        verified = _prompt_wallet_password(wallet_name, wallet_dir,
+                                           _wallet_cosigner_key_hashes)
+        if verified is None:
             return
+        candidates = verified[1]
 
     console.print(f"\n[bold green]Cosigner key hashes for '{wallet_name}':[/bold green]")
     for label, kh in candidates.items():
