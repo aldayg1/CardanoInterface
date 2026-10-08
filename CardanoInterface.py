@@ -725,8 +725,13 @@ class KoiosBackend(CardanoBackend):
 
     def _utxos(self, address: str) -> list[UTxO]:
         try:
+            # _extended is what makes Koios populate asset_list; without it
+            # every UTxO parses as pure ADA and a token-holding wallet looks
+            # empty of tokens — no asset picker, and sweeps/builds that drop
+            # the tokens (observed on preprod 2026-10-07).
             resp = requests.post(f"{self.base_url}/address_utxos",
-                                 json={"_addresses": [address]}, timeout=15)
+                                 json={"_addresses": [address], "_extended": True},
+                                 timeout=15)
             if resp.status_code == 404:
                 return []
             resp.raise_for_status()
@@ -6442,6 +6447,12 @@ def funds_send() -> None:
 
         amount_lovelace = 0
         if not sweep:
+            # Ask against a number the wallet actually holds: the fee comes
+            # out of the same balance (parity with the multisig builder).
+            live = context.utxos(sender_address_str) if context else []
+            balance = sum(u.output.amount.coin for u in live)
+            console.print(f"[dim]This wallet holds {format_ada(balance)} ADA; the "
+                          "fee comes out of the same balance.[/dim]")
             console.print("[bold]Enter amount of Cardano Native Token ADA to send"
                           " (minimum 0.000001) or type 'cancel' to abort:[/bold]")
             while True:
@@ -6562,7 +6573,22 @@ def send_ada(wallet_dir: str, recipient: str, amount_lovelace: int, password: st
                 # every UTxO consolidates the address and always leaves maximal
                 # change, so retry that way before giving up.
                 console.print("[yellow]Re-selecting coins across all UTxOs...[/yellow]")
-                signed_tx = _build_tx(spend_every_utxo=True)
+                try:
+                    signed_tx = _build_tx(spend_every_utxo=True)
+                except (UTxOSelectionException, TransactionBuilderException) as e:
+                    # If even the consolidation build cannot fund it, the amount
+                    # is genuinely unfundable: the fee and the minimum ADA any
+                    # leftover change must carry come out of the same balance
+                    # (observed on mainnet 2026-08-21 as a raw "All UTxO
+                    # selectors failed"). Name the real balance instead.
+                    balance = sum(u.output.amount.coin for u in utxos)
+                    raise ValueError(
+                        f"This wallet holds {format_ada(balance)} ADA and cannot "
+                        f"send {format_ada(amount_lovelace)} ADA: the fee plus "
+                        f"the minimum ADA for the change output come out of the "
+                        f"same balance. Try a smaller amount, or go back and "
+                        f"choose EVERYTHING to send all of it."
+                    ) from e
 
         try:
             # Submit the transaction

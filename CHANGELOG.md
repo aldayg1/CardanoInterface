@@ -21,6 +21,27 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   and chain-confirmed (tx `9ff46563…`, 4/4 `audit/results/senddoor_retry.json`)
   — also the first chain-proof of the Koios submit path.
 
+- Koios backend: token bundles were invisible. `address_utxos` populates
+  `asset_list` only when `_extended: true` is requested, so on the Koios
+  backend every wallet parsed as pure ADA — token-holding wallets got no
+  "Choose assets" option in the send selector, and sweeps/builds modelled
+  transactions that drop the tokens (the ledger rejects those with
+  ValueNotConserved). Fixed by requesting `_extended`.
+
+- Personal Send Funds: the amount prompt now shows the live balance, and
+  an unfundable amount (balance minus fee minus the change minimum) is
+  refused in plain words naming the real balance and the EVERYTHING
+  alternative — the raw "All UTxO selectors failed" from the operator's
+  2026-08-21 mainnet session can no longer surface from this door.
+
+- Validated live on preprod over Koios with a token-heavy wallet, 7/7
+  (`audit/results/koios_assets.json`): assets table, asset picker,
+  multi-asset partial+all send confirmed by deltas, over-balance refusal,
+  sweep leaving the wallet at zero UTxOs. Mainnet Koios read-only 3/3
+  (`audit/results/mainnet_koios_health.json`): mainnet+Koios boots in the
+  TUI, the health door answers, newest-epoch parameters fetch. Nothing
+  was submitted on mainnet.
+
 ## [Unreleased] — 2026-09-28
 
 ### Added
