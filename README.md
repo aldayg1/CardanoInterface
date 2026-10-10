@@ -2,6 +2,11 @@
 
 [![pipeline status](https://gitlab.com/RefracticLabs/cardanointerface/badges/main/pipeline.svg)](https://gitlab.com/RefracticLabs/cardanointerface/-/pipelines)
 
+> **Risk notice.** This software moves real funds. Test every flow on
+> Preprod with small amounts before Mainnet. You alone control your
+> keys and transactions; the authors accept no liability for loss.
+> Not financial advice. See [LICENSE](LICENSE) (MIT, no warranty).
+
 Local, sovereign Cardano wallet interface with multisig support. Create wallets, manage funds, and recover from sunset wallet providers — all from your own machine, no hosted services required.
 
 **Who is this for?** You hold funds in a Cardano multisig wallet and its provider disappeared (Nami deprecated, Typhon multisig rejected, Lace shared wallets limited) — or your DAO/treasury wants threshold spending without trusting a hosted service. If that is not you, the [multisig recovery story](#why-cardanointerface) below is still the fastest way to see what this does.
