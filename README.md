@@ -2,6 +2,9 @@
 
 [![pipeline status](https://gitlab.com/RefracticLabs/cardanointerface/badges/main/pipeline.svg)](https://gitlab.com/RefracticLabs/cardanointerface/-/pipelines)
 
+<!-- Mirror note: this GitHub repo is a read-only mirror of GitLab
+     (origin). CI runs on GitLab — the badge above is the live signal. -->
+
 > **Risk notice.** This software moves real funds. Test every flow on
 > Preprod with small amounts before Mainnet. You alone control your
 > keys and transactions; the authors accept no liability for loss.
