@@ -30,16 +30,19 @@ Every written test file carries a provenance header (oracle, generator, date).
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 import re
 import subprocess
+import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, cast
 
 from . import concerns, knowledge
 
@@ -196,8 +199,9 @@ class BuilderState(TypedDict, total=False):
     prior_failure: dict[str, str]
     intel: dict[str, dict[str, object]]
     review_dir: str
-    approved: list[str]
     written: list[str]
+    approval_source: str
+    unattended: bool
     verify: dict[str, object]
     assessment_notes: str
     validation_flags: dict[str, list[str]]
@@ -488,6 +492,94 @@ def _run_cmd(cmd: list[str], cwd: str) -> subprocess.CompletedProcess[str]:
                           timeout=600, env=_repo_env())
 
 
+def _draft_digest(path: Path) -> str:
+    """Content identity of a reviewed draft: sha256 of its current bytes."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _sandboxed_run_cmd(cmd: list[str], cwd: str) -> subprocess.CompletedProcess[str]:
+    """Check-phase execution carries no operator authority.
+
+    A draft at this point is unreviewed model output, so when it is executed
+    (pytest imports the module: module-level code runs) it runs inside a
+    bubblewrap sandbox — the whole filesystem read-only except the review
+    directory and a scratch /tmp, no network, a cleared environment, and the
+    wallet/user data trees plus local secrets masked out entirely. A draft
+    can prove it passes; it cannot read secrets, reach the network, or write
+    anywhere that matters. bwrap missing is a hard error: the check never
+    falls back to unsandboxed execution.
+    """
+    # The scratch mount is the sandbox's only writable directory besides the
+    # repo bind's own allowed paths, so it must NOT live under /tmp inside the
+    # sandbox (that would shadow the repo when the repo is there); /var/tmp is
+    # not mounted at all under the deny-by-default policy below.
+    scratch_parent = "/var/tmp" if os.path.isdir("/var/tmp") else cwd
+    scratch = tempfile.mkdtemp(prefix="tb-check-", dir=scratch_parent)
+    repo = Path(cwd).resolve()
+    review = repo / "tests" / "_review"
+    empty = Path(scratch) / "empty"
+    empty.write_bytes(b"")
+    masks: list[str] = []
+    for secret_dir in (repo / "CardanoInterface" / "wallets",
+                       repo / "CardanoInterface" / "users"):
+        if secret_dir.exists():
+            masks += ["--tmpfs", str(secret_dir)]
+    for secret_file in (repo / "CREDENTIALS.local.md",
+                        repo / "debug_main.log"):
+        if secret_file.exists():
+            # /dev/null cannot be bind-mounted unprivileged; an empty file
+            # hides the secret just as completely.
+            masks += ["--ro-bind", str(empty), str(secret_file)]
+    # A uv-managed venv's python is a symlink into the interpreter's own
+    # prefix (.../cpython-X.Y.Z-linux-x86_64-gnu/bin/python3.13). With no
+    # root bind that prefix must be mounted explicitly or the venv's pytest
+    # could not even exec inside the sandbox.
+    interp_prefixes: list[str] = []
+    for exe in (sys.executable, str(repo / ".venv" / "bin" / "python")):
+        try:
+            prefix = Path(os.path.realpath(exe)).parent.parent
+        except OSError:
+            continue
+        if prefix != Path("/") and str(prefix) not in interp_prefixes:
+            interp_prefixes.append(str(prefix))
+    env = {"PATH": "/usr/bin:/bin", "TMPDIR": scratch, "HOME": scratch,
+           "PYTHONDONTWRITEBYTECODE": "1"}
+    wrapped = [
+        "bwrap",
+        # Deny-by-default filesystem: only the mounts the check needs exist,
+        # so a draft cannot read anything else on the host (home-directory
+        # credentials, other projects) — the masks above stay as an extra
+        # layer over the repo's own data trees.
+        "--ro-bind", "/usr", "/usr",
+        "--symlink", "usr/lib", "/lib",
+        "--symlink", "usr/lib64", "/lib64",
+        "--symlink", "usr/bin", "/bin",
+        "--symlink", "usr/sbin", "/sbin",
+        "--ro-bind", "/etc", "/etc",
+        # Device nodes from the host are unusable under a user namespace;
+        # give the sandbox its own /dev (null/zero/random — pytest needs it).
+        "--dev", "/dev",
+        "--proc", "/proc",
+        "--tmpfs", "/tmp",
+        *sum((["--ro-bind", p, p] for p in interp_prefixes), []),
+        "--ro-bind", str(repo), str(repo),
+        *masks,
+        # tests/_review stores the approval artifacts (approved.json,
+        # machine_validated.json); the executing draft may read its own file
+        # but must never write them — pytest's cache is disabled
+        # (-p no:cacheprovider) and its TMPDIR/HOME are the scratch below.
+        "--ro-bind", str(review), str(review),
+        # The scratch dir mounts at its own path (never under the repo), so
+        # mounting it cannot shadow anything the sandbox needs.
+        "--bind", scratch, scratch,
+        "--unshare-net", "--die-with-parent", "--clearenv",
+        *sum((["--setenv", k, v] for k, v in env.items()), []),
+        *cmd,
+    ]
+    return subprocess.run(wrapped, cwd=cwd, capture_output=True, text=True,
+                          timeout=600, env=env)
+
+
 def check_node(state: BuilderState) -> dict[str, object]:
     """Deterministic gate after drafting — the model NEVER sees failure
     output. Each draft is written and hit with ruff --fix + ruff + pytest;
@@ -508,8 +600,32 @@ def check_node(state: BuilderState) -> dict[str, object]:
                  state["repo_path"])
         ruff = _run_cmd(["uv", "run", "ruff", "check", str(review_file)],
                         state["repo_path"])
-        pytest_run = _run_cmd(["uv", "run", "pytest", str(review_file), "-q",
-                               "--no-header"], state["repo_path"])
+        # The draft executes here, before any review: sandboxed, from the
+        # project venv (no uv step, no cache writes), cache-less pytest.
+        repo_venv = Path(state["repo_path"]) / ".venv" / "bin"
+        pytest_bin = repo_venv / "pytest"
+        if not pytest_bin.exists():
+            errors.append(
+                f"{draft['symbol']}: NOT EXECUTED — no .venv/bin/pytest in "
+                "the repo (run `uv sync`); the check phase never runs "
+                "unreviewed code outside the sandbox")
+            tags.append({"symbol": draft["symbol"],
+                         "description": "check unavailable: sandbox prerequisite "
+                                        "missing (.venv/bin/pytest)"})
+            continue
+        try:
+            pytest_run = _sandboxed_run_cmd(
+                [str(pytest_bin), str(review_file), "-q", "--no-header",
+                 "-p", "no:cacheprovider"], state["repo_path"])
+        except (FileNotFoundError, OSError) as sandbox_err:
+            errors.append(
+                f"{draft['symbol']}: NOT EXECUTED — the check sandbox is "
+                f"unavailable ({sandbox_err}); install bubblewrap or run the "
+                "check on a host that has it. Unreviewed code never runs "
+                "outside the sandbox")
+            tags.append({"symbol": draft["symbol"],
+                         "description": "check unavailable: no sandbox (bwrap)"})
+            continue
         if ruff.returncode == 0 and pytest_run.returncode == 0:
             clean.append(draft)
             continue
@@ -595,8 +711,10 @@ def validate_node(state: BuilderState) -> dict[str, object]:
                 "built from a premise that is not the DB's current version "
                 f"(built {ohash}, live {registered['hash']}) — knowledge is "
                 "not fresh")
-        if ohash and f"Oracle-Hash: {ohash}" not in code:
-            checks.append("missing freshness stamp (Oracle-Hash)")
+        stamps = knowledge._oracle_stamps(code)
+        if ohash and stamps != [ohash]:
+            checks.append("oracle stamp missing, stale, or not unique "
+                          f"(found {stamps}, expected [{ohash}])")
         if not re.search(r"^def test_", code, re.MULTILINE):
             checks.append("no test functions")
         if 'match="' in code:
@@ -618,9 +736,16 @@ def validate_node(state: BuilderState) -> dict[str, object]:
             approved.append(symbol)
         else:
             errors.append(f"validate: {symbol} flagged — " + "; ".join(checks))
+    # Machine validation is recorded as its own, distinguishable artifact —
+    # never as approved.json, which only an assessing principal writes. The
+    # digests bind the verdict to the exact reviewed bytes, so a draft that
+    # changes afterwards cannot ride this validation into the suite.
     if approved:
-        (review_dir / "approved.json").write_text(
-            json.dumps(approved, indent=2) + "\n", encoding="utf-8")
+        (review_dir / "machine_validated.json").write_text(
+            json.dumps({"approver": "machine",
+                        "digests": {sym: _draft_digest(review_dir / f"draft_{sym}.py")
+                                    for sym in approved}}, indent=2) + "\n",
+            encoding="utf-8")
     return {"validation_flags": flags, "errors": errors}
 
 
@@ -628,21 +753,57 @@ def write_node(state: BuilderState) -> dict[str, object]:
     errors: list[str] = list(state.get("errors") or [])
     if not state.get("plans"):
         return {"errors": errors + ["write skipped: no plans survived validation"]}
-    approved_file = Path(state["review_dir"]) / "approved.json"
-    if not approved_file.exists():
+    review_dir = Path(state["review_dir"])
+    # Approval is content-bound and principal-bound. approved.json carries
+    # {"approver": "agent", "digests": {symbol: sha256}} written only by the
+    # assessing flow (--approve / the TUI); machine validation lives in
+    # machine_validated.json and is only consumable by an explicitly
+    # unattended (refresh) run, visibly recorded as machine-written.
+    approval_file = review_dir / "approved.json"
+    approval_source = "agent"
+    if not approval_file.exists():
+        machine_file = review_dir / "machine_validated.json"
+        if machine_file.exists() and state.get("unattended"):
+            approval_file = machine_file
+            approval_source = "machine (unattended refresh)"
+        else:
+            return {"errors": errors
+                    + ["write refused: approved.json missing — ASSESS the drafts "
+                       "first (read tests/_review/draft_*.py, then record "
+                       "approval with --approve). Machine validation is not "
+                       "approval."]}
+    try:
+        raw: object = json.loads(approval_file.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as e:
+        return {"errors": errors + [f"write refused: approval file unreadable: {e}"]}
+    if not isinstance(raw, dict):
         return {"errors": errors
-                + ["write refused: approved.json missing — ASSESS the drafts first "
-                   "(read tests/_review/draft_*.py, then record approved symbols)"]}
-    recorded = json.loads(approved_file.read_text(encoding="utf-8"))
-    if not isinstance(recorded, list) or not recorded:
-        return {"errors": errors + ["write refused: approved.json is empty or invalid"]}
+                + ["write refused: approval file is not a JSON object — "
+                   "re-approve with --approve after reading the drafts"]}
+    recorded = cast("dict[str, object]", raw)
+    digests_raw = recorded.get("digests")
+    if not isinstance(digests_raw, dict) or not digests_raw:
+        return {"errors": errors
+                + ["write refused: approval file is empty, invalid, or the old "
+                   "name-only format — re-approve with --approve after reading "
+                   "the drafts"]}
+    digests = cast("dict[str, str]", digests_raw)
     touched_concerns: set[str] = set()
-    for symbol in recorded:
+    for symbol, approved_digest in digests.items():
         # The REVIEWED file is the source of truth: the driving agent may have
-        # hand-edited drafts during assessment (state drafts are stale).
-        review_file = Path(state["review_dir"]) / f"draft_{symbol}.py"
+        # hand-edited drafts during assessment (state drafts are stale). The
+        # digest recorded at approval time proves the bytes now on disk are
+        # the same ones that were read.
+        review_file = review_dir / f"draft_{symbol}.py"
         if not review_file.exists():
             errors.append(f"write: approved symbol {symbol} has no reviewed draft file")
+            continue
+        if not isinstance(approved_digest, str) \
+                or _draft_digest(review_file) != approved_digest:
+            errors.append(
+                f"write refused: {symbol} changed since approval — the draft "
+                "on disk is not what was approved. Re-assess it, then "
+                "re-approve.")
             continue
         concern = concerns.get_concern(symbol)
         knowledge.save_approved(concern, symbol,
@@ -659,15 +820,28 @@ def write_node(state: BuilderState) -> dict[str, object]:
         written.append(str(dest))
     if not written:
         errors.append("write: no approved drafts were written")
-    return {"written": written, "errors": errors}
+    return {"written": written, "errors": errors,
+            "approval_source": approval_source}
 
 
 def verify_node(state: BuilderState) -> dict[str, object]:
     errors: list[str] = list(state.get("errors") or [])
     result: dict[str, object] = {"pytest_ok": False, "ruff_ok": False}
+    pytest_bin = Path(state["repo_path"]) / ".venv" / "bin" / "pytest"
     for path in state.get("written", []):
-        proc = _run_cmd(["uv", "run", "pytest", path, "-q", "--no-header"],
-                        state["repo_path"])
+        # In the unattended refresh the written bytes were never human-read;
+        # verify executes them under the same sandbox as the check phase, so
+        # no operator authority (ambient environment, network, filesystem)
+        # ever reaches unreviewed code. Ruff parses text only, not Python.
+        try:
+            proc = _sandboxed_run_cmd(
+                [str(pytest_bin), path, "-q", "--no-header",
+                 "-p", "no:cacheprovider"], state["repo_path"])
+        except (FileNotFoundError, OSError) as sandbox_err:
+            errors.append(f"verify FAILED for {path}: sandbox unavailable "
+                          f"({sandbox_err}) — unreviewed code never runs "
+                          "outside the sandbox")
+            continue
         result["pytest_output"] = (proc.stdout + proc.stderr)[-3000:]
         if proc.returncode != 0:
             errors.append(f"verify FAILED (pytest) for {path}:\n{result['pytest_output']}")

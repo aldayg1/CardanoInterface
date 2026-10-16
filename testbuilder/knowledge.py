@@ -9,6 +9,7 @@ files remain on disk as history.
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -244,9 +245,17 @@ def metrics(limit: int = 6) -> list[dict[str, object]]:
     return out
 
 
+def _oracle_stamps(text: str) -> list[str]:
+    """Every Oracle-Hash stamp in a file, in order."""
+    return re.findall(r"^# Oracle-Hash: (\S+)", text, re.MULTILINE)
+
+
 def stale_symbols() -> list[tuple[str, str]]:
     """(symbol, reason) for every registry symbol whose test is missing,
-    failed its last verification, or was built from a different oracle hash."""
+    failed its last verification, or whose provenance does not match the
+    oracle DB. The stamp must be unique and equal the registered hash: a
+    second, foreign stamp means the file documents a different oracle than
+    the DB, however the fresh one got there."""
     reasons: list[tuple[str, str]] = []
     index = {e.get("symbol"): e for e in _load_index()}
     from testbuilder import concerns  # local import: concerns has no deps
@@ -257,8 +266,11 @@ def stale_symbols() -> list[tuple[str, str]]:
         if not approved.exists():
             reasons.append((symbol, "no approved source"))
             continue
-        if f"Oracle-Hash: {h}" not in approved.read_text(encoding="utf-8"):
-            reasons.append((symbol, "built from an older oracle (hash mismatch)"))
+        stamps = _oracle_stamps(approved.read_text(encoding="utf-8"))
+        if len(stamps) != 1 or stamps[0] != h:
+            reasons.append((symbol,
+                            f"oracle stamp missing, stale, or not unique "
+                            f"(found {stamps}, live {h})"))
             continue
         last = index.get(symbol)
         if last and last.get("verify") != "pass":
@@ -268,15 +280,21 @@ def stale_symbols() -> list[tuple[str, str]]:
 
 def stamp_approved(concern: str, symbol: str, oracle_hash: str) -> None:
     """Stamp an approved source with the oracle hash it was built/assessed
-    against. The stamp is the freshness token the sweep checks."""
+    against. The stamp is the freshness token the sweep checks, so a file
+    carrying a DIFFERENT stamp is remade, never double-stamped."""
     approved = APPROVED_DIR / concern / f"{symbol}.py"
     if not approved.exists():
         return
     text = approved.read_text(encoding="utf-8")
-    stamp = f"# Oracle-Hash: {oracle_hash}"
-    if stamp in text:
+    stamps = _oracle_stamps(text)
+    if stamps == [oracle_hash]:
         return
-    approved.write_text(f"{stamp}\n{text}", encoding="utf-8")
+    if stamps:
+        raise ValueError(
+            f"{approved} already carries oracle stamp(s) {stamps}; refusing to "
+            f"stamp {oracle_hash} — re-assess against the current oracle "
+            "instead of accumulating stamps")
+    approved.write_text(f"# Oracle-Hash: {oracle_hash}\n{text}", encoding="utf-8")
 
 
 # ── Defective branding: failed remakes are quarantined, never hidden ──────

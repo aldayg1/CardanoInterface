@@ -90,9 +90,15 @@ def _review_state() -> dict[str, object]:
     approved: list[str] = []
     if approved_file.exists():
         try:
-            approved = json.loads(approved_file.read_text(encoding="utf-8"))
+            raw: object = json.loads(approved_file.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             approved = ["<INVALID approved.json>"]
+            raw = None
+        if isinstance(raw, dict):
+            digests = raw.get("digests")
+            if isinstance(digests, dict) and all(
+                    isinstance(k, str) for k in digests):
+                approved = [str(k) for k in digests]
     return {"drafts": drafts, "approved": approved,
             "awaiting_assessment": bool(drafts) and not approved}
 
@@ -116,14 +122,15 @@ def _metrics_trend() -> None:
 
 def _approve_flow(session: PromptSession) -> None:
     state = _review_state()
-    drafts = state["drafts"]
+    listed = state["drafts"]
+    drafts = [str(d) for d in listed] if isinstance(listed, list) else []
     if not drafts:
         console.print("[yellow]no drafts in the assessment queue[/yellow]")
         return
     console.print("drafts:", ", ".join(drafts))
-    raw = session.prompt(
-        "approve which? (comma-separated symbols, 'all', or empty to cancel): ")
-    raw = raw.strip()
+    raw = str(session.prompt(
+        "approve which? (comma-separated symbols, 'all', or empty to cancel): "
+    )).strip()
     if not raw:
         console.print("cancelled")
         return
@@ -133,9 +140,18 @@ def _approve_flow(session: PromptSession) -> None:
     if unknown and raw != "all":
         console.print(f"[red]not drafts: {unknown}[/red]")
         return
+    import hashlib
+    digests: dict[str, str] = {}
+    for symbol in chosen:
+        draft = REVIEW_DIR / f"draft_{symbol}.py"
+        if not draft.exists():
+            console.print(f"[red]no reviewed draft file for {symbol}[/red]")
+            return
+        digests[symbol] = hashlib.sha256(draft.read_bytes()).hexdigest()
     (REVIEW_DIR / "approved.json").write_text(
-        json.dumps(chosen, indent=2) + "\n", encoding="utf-8")
-    console.print(f"approved: {chosen}")
+        json.dumps({"approver": "agent", "digests": digests}, indent=2) + "\n",
+        encoding="utf-8")
+    console.print(f"approved (content-bound): {chosen}")
     notes = session.prompt("assessment notes for the KB (optional): ").strip()
     _run(["uv", "run", "python", "-m", "testbuilder.cli", ".",
           "CardanoInterface.py", "--complete", *(

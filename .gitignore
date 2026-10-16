@@ -32,7 +32,14 @@ CLAUDE.md
 BACKLOG.md
 MULTISIG_SPEC.md
 draft/
-audit/
+# audit/ stays untracked except the CI guard battery, which must exist on a
+# fresh clone or the pipeline gate fails for every merge (git cannot
+# re-include under an excluded directory, so the tree is narrowed instead).
+audit/*
+!audit/ci/
+audit/ci/*
+!audit/ci/source_guards.py
+!audit/ci/rich_balance.py
 .python-version
 
 # Internal strategy — holds-for-renewal is not public. Never commit.
@@ -42,3 +49,4 @@ PRIVATE_ROADMAP.md
 # testbuilder/kb/); the composed suite and the KB are the committed artifacts.
 tests/_review/
 testbuilder/kb/last_report.md
+testbuilder/kb/sources/

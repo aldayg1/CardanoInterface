@@ -66,6 +66,13 @@ test:
   - uv sync --locked
   - uv run mypy CardanoInterface.py
   - uv run ruff check CardanoInterface.py
+  # Source-guard battery (rule 5/2/9b greps + rich balance) — the SAME tracked
+  # script the local pre-commit/pre-push hooks run, so the merge path cannot
+  # diverge from the commit path again. Whole-file: CI sees the merged result.
+  # The battery's sibling script must be present on this fresh clone; a
+  # missing dependency is an infrastructure error, not a rule violation.
+  - test -f audit/ci/rich_balance.py || { echo 'audit/ci/rich_balance.py is not tracked — battery incomplete'; exit 1; }
+  - python3 audit/ci/source_guards.py CardanoInterface.py
   rules:
   - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
   - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'

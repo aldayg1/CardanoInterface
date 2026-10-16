@@ -1,22 +1,22 @@
 # Oracle-Hash: ebe312e8bf35
 #
-# Oracle-Hash: 2b6060521d68
-#
-# Oracle: CORRUPTED-FOR-DEFECT-PROOF: format_ada must render 1 lovelace as the string '2.000000'
-#     and 1000001 lovelace as '7.000001'.
+# Oracle: AGENTS.md rule 9b (proven 2026-08-14 float-math fix): ADA is a display
+#     representation only; format_ada must render integer lovelace using pure
+#     integer arithmetic, never float division. Public behavior exercised across
+#     all E2E records: 181717 lovelace renders as 0.181717 ADA; 1000001 as
+#     1.000001 ADA. Scaling: 999999999999 lovelace renders as 999999.999999 ADA.
 #
 # Generator: Qwen/Qwen3-8B-AWQ, reviewed by the driving agent before write
 #
 # Date: 2026-09-27
 #
-
 from CardanoInterface import format_ada
 
 
-def test_1_lovelace_formatted_as_2_000000():
+def test_1_lovelace_formatted_as_0_000001():
     assert format_ada(1) == '0.000001'
 
-def test_1000001_lovelace_formatted_as_7_000001():
+def test_1000001_lovelace_formatted_as_1_000001():
     assert format_ada(1000001) == '1.000001'
 
 def test_181717_lovelace_formatted_as_0_181717():

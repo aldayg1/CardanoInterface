@@ -3,22 +3,72 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sys
 
 LOG_PATH = os.path.abspath("debug_main.log")
 try:
-    # Ensure the log file is writable before anything else
-    with open(LOG_PATH, 'a') as f:
-        pass
-except Exception as e:
+    # Create the log the same way secret files are created: owner-only and
+    # never through a pre-planted symlink. This runs before the process umask
+    # is pinned, so the mode is set here rather than inherited; a symlink at
+    # the path is refused instead of being appended into.
+    _log_fd = os.open(LOG_PATH,
+                      os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
+                      0o600)
+    os.fchmod(_log_fd, 0o600)
+    os.close(_log_fd)
+except OSError as e:
     print(f"[ERROR] Cannot write to debug_main.log: {e}")
     sys.exit(1)
+def _flatten_log_text(value: str) -> str:
+    """Escape line breaks so external text cannot forge a log record."""
+    return value.replace("\r", "\\r").replace("\n", "\\n")
+
+
+class _SingleLineLogFilter(logging.Filter):
+    """Keep every log record on one line.
+
+    External strings (package identifiers, backend replies) reach log calls
+    as arguments; an embedded newline would start a fresh, correctly-shaped
+    record — a forged log entry. Newlines and carriage returns in what is
+    logged are escaped instead.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # getMessage() renders msg with its args into one str; storing that
+        # back (args cleared) both flattens external text and avoids a second
+        # %-formatting pass by the handler.
+        record.msg = _flatten_log_text(record.getMessage())
+        record.args = None
+        # The traceback is rendered by the handler's formatter AFTER this
+        # filter runs, so an external string inside any exception message
+        # would keep its raw newline there and start a forged record on the
+        # next line. Render it here instead; frame lines are indented and
+        # trusted, while exception-message lines start at column 0 and may
+        # embed external text, so each of those is flattened (a no-op on the
+        # fixed Traceback/cause headers).
+        if record.exc_info is not None:
+            rendered = traceback.format_exception(*record.exc_info)
+        elif record.exc_text:
+            rendered = record.exc_text.splitlines(keepends=True)
+        else:
+            rendered = None
+        if rendered is not None:
+            record.exc_text = "".join(
+                _flatten_log_text(line) if line[:1] not in (" ", "\t") else line
+                for line in rendered)
+            record.exc_info = None
+        return True
+
+
 logging.basicConfig(
     filename=LOG_PATH,
     level=logging.DEBUG,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_SingleLineLogFilter())
 logging.info("[START] CardanoInterface.py script started.")
 logging.info(f"Python executable: {sys.executable}")
 logging.info(f"Python version: {sys.version}")
@@ -38,6 +88,7 @@ import re
 import secrets
 import shutil
 import time
+import traceback
 from base64 import urlsafe_b64encode
 from collections import defaultdict
 from collections.abc import Callable
@@ -113,12 +164,14 @@ from pycardano.plutus import PLUTUS_V1_COST_MODEL, PLUTUS_V2_COST_MODEL
 _pycardano_logger = logging.getLogger("PyCardano")
 _pycardano_logger.handlers.clear()
 _pycardano_file_handler = logging.FileHandler(LOG_PATH)
+_pycardano_file_handler.addFilter(_SingleLineLogFilter())
 _pycardano_file_handler.setFormatter(
     logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
 _pycardano_logger.addHandler(_pycardano_file_handler)
 
 from rich.console import Console
 from rich.live import Live
+from rich.markup import escape as _rich_escape
 from rich.progress import (
     Progress,
     SpinnerColumn,
@@ -180,8 +233,25 @@ def _dumps_json(value: JSON, indent: int | None = 2) -> str:
 
 
 def _dump_json(value: JSON, path: str, indent: int = 2) -> None:
-    with open(path, "w") as f:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(value, f, indent=indent)
+        os.fchmod(f.fileno(), 0o600)
+
+
+def _write_secret_bytes(path: str, data: bytes) -> None:
+    """Write an at-rest secret: owner-only, never through a planted link.
+
+    O_NOFOLLOW makes a symlink at `path` a hard error instead of a silent
+    write into whatever it points at; fchmod repairs the mode of a
+    pre-existing file, which open-for-write alone would leave as it was.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+        os.fchmod(f.fileno(), 0o600)
 
 
 def _canonical_json_bytes(value: JSON) -> bytes:
@@ -207,17 +277,67 @@ def _json_str(value: JSON, default: str = "") -> str:
     return value if isinstance(value, str) else default
 
 
+_TX_ID_RE = re.compile(r"[0-9a-fA-F]{64}")
+
+
+def _returned_tx_id(raw: JSON) -> str | None:
+    """A submit result's transaction id, only when it is shaped like one.
+
+    The id comes from the backend's reply. Anything that is not exactly 64
+    hex characters is displayed as nothing rather than printed as someone
+    else's bytes.
+    """
+    if isinstance(raw, str) and _TX_ID_RE.fullmatch(raw):
+        return raw
+    if raw not in (None, ""):
+        logging.warning("Submit result carried a non-transaction-id string; "
+                        "not displayed.")
+    return None
+
+
+def _display_text(text: str) -> str:
+    """Make an external string safe for Rich-markup display.
+
+    Package names, cosigner labels, on-chain asset names and backend replies
+    are someone else's bytes: they are escaped so they can style nothing,
+    link nothing and erase nothing on this screen, and line breaks are
+    flattened so they cannot add lines that read as this program's own
+    output.
+    """
+    return _rich_escape(text.replace("\r", " ").replace("\n", " "))
+
+
 def _json_int(value: JSON, default: int = 0) -> int:
     if isinstance(value, bool):
         return int(value)
-    if isinstance(value, (int, float)):
-        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        # NaN/Infinity are not integers; json.loads accepts them by default,
+        # and int(nan) would abort the whole parameter fetch.
+        return int(value) if math.isfinite(value) else default
     if isinstance(value, str):
         try:
             return int(value)
         except ValueError:
             return default
     return default
+
+
+def _protocol_int(value: JSON, default: int, low: int, high: int) -> int:
+    """A server-supplied protocol parameter, bounded to a plausible range.
+
+    These numbers feed fee and min-UTxO money math directly. A lying or
+    hostile endpoint must not push them to an attacker-chosen multiple (an
+    inflated fee paid silently) or make them negative: anything outside the
+    era's plausible range falls back to the known-honest default.
+    """
+    parsed = _json_int(value, default)
+    if parsed < low or parsed > high:
+        logging.warning(f"Protocol parameter out of range ({value!r}); "
+                        f"using {default}")
+        return default
+    return parsed
 
 
 def _wallet_entry_name(entry: JSON) -> str:
@@ -236,8 +356,8 @@ def _migrate_wallet_entries(user_data: dict[str, JSON], user_password: str) -> b
     migrated = False
     for i, w in enumerate(wallets):
         if isinstance(w, str):
-            wallet_dir = secure_path_join(WALLET_DIR, w)
             try:
+                wallet_dir = secure_path_join(WALLET_DIR, w)
                 address = load_encrypted_address(wallet_dir, user_password)
             except Exception:
                 address = ""
@@ -607,7 +727,7 @@ class BlockfrostBackend(CardanoBackend):
             if not resp.content:
                 return None
             raw: JSON = resp.json()
-            return raw if isinstance(raw, str) else None
+            return _returned_tx_id(raw)
         except _REQUEST_ERROR as e:
             logging.error(f"Failed to submit transaction: {e}")
             raise TransactionSubmissionError(str(e)) from e
@@ -633,18 +753,22 @@ class BlockfrostBackend(CardanoBackend):
         except Exception as e:
             logging.error(f"[protocol_param] Failed to fetch protocol parameters:"
                           f" {e}", exc_info=True)
-            console.print(f"[red]Failed to fetch protocol parameters: {e}[/red]")
+            console.print(f"[red]Failed to fetch protocol parameters: "
+                  f"{_display_text(str(e))}[/red]")
             raise
         params = _json_object(raw)
         try:
             self._protocol_param = ProtocolParameters(
-                min_fee_constant=_json_int(params.get('min_fee_b'), 155381),
-                min_fee_coefficient=_json_int(params.get('min_fee_a'), 44),
+                min_fee_constant=_protocol_int(params.get('min_fee_b'), 155381, 0, 10_000_000),
+                min_fee_coefficient=_protocol_int(params.get('min_fee_a'), 44, 0, 10_000),
                 max_block_size=_json_int(params.get('max_block_size'), 90112),
-                max_tx_size=_json_int(params.get('max_tx_size'), 16384),
+                max_tx_size=_protocol_int(params.get('max_tx_size'), 16384, 256, 1_048_576),
                 max_block_header_size=_json_int(params.get('max_block_header_size'), 2176),
-                key_deposit=_json_int(params.get('key_deposit'), 2000000),
-                pool_deposit=_json_int(params.get('pool_deposit'), 500000000),
+                key_deposit=_protocol_int(
+                    params.get('key_deposit'), 2_000_000, 0, 10_000_000_000),
+                pool_deposit=_protocol_int(
+                    params.get('pool_deposit'), 500_000_000, 0,
+                    10_000_000_000),
                 pool_influence=_json_fraction(params.get('a0'), Fraction(0)),
                 monetary_expansion=_json_fraction(params.get('rho'), Fraction(0)),
                 treasury_expansion=_json_fraction(params.get('tau'), Fraction(0)),
@@ -664,9 +788,10 @@ class BlockfrostBackend(CardanoBackend):
                 max_val_size=_json_int(params.get('max_val_size'), 5000),
                 collateral_percent=_json_int(params.get('collateral_percent'), 150),
                 max_collateral_inputs=_json_int(params.get('max_collateral_inputs'), 3),
-                coins_per_utxo_word=(
-                    _json_int(params.get('coins_per_utxo_word'), 34482) or 34482),
-                coins_per_utxo_byte=_json_int(params.get('coins_per_utxo_size'), 4310),
+                coins_per_utxo_word=_protocol_int(
+                    params.get('coins_per_utxo_word'), 34482, 1, 100_000),
+                coins_per_utxo_byte=_protocol_int(
+                    params.get('coins_per_utxo_size'), 4310, 1, 100_000),
                 cost_models=_cost_models_from_json(params.get('cost_models')),
                 maximum_reference_scripts_size={"bytes": _json_int(
                     params.get('maximum_reference_scripts_size'), 16384)},
@@ -677,7 +802,8 @@ class BlockfrostBackend(CardanoBackend):
         except Exception as e:
             logging.error(f"[protocol_param] Error mapping protocol parameters: {e}",
                           exc_info=True)
-            console.print(f"[red]Error mapping protocol parameters: {e}[/red]")
+            console.print(f"[red]Error mapping protocol parameters: "
+                  f"{_display_text(str(e))}[/red]")
             raise
         return self._protocol_param
 
@@ -782,7 +908,7 @@ class KoiosBackend(CardanoBackend):
             raise TransactionSubmissionError(
                 f"Koios rejected the transaction (HTTP {resp.status_code}): {detail}")
         raw: JSON = resp.json()
-        return raw if isinstance(raw, str) else None
+        return _returned_tx_id(raw)
 
     def health(self) -> dict[str, JSON]:
         # Koios has no dedicated health endpoint; a tip answer is the health.
@@ -805,7 +931,8 @@ class KoiosBackend(CardanoBackend):
         except Exception as e:
             logging.error(f"[protocol_param] Failed to fetch protocol parameters "
                           f"from Koios: {e}", exc_info=True)
-            console.print(f"[red]Failed to fetch protocol parameters: {e}[/red]")
+            console.print(f"[red]Failed to fetch protocol parameters: "
+                  f"{_display_text(str(e))}[/red]")
             raise
         entries = _json_list(raw)
         if not entries:
@@ -816,13 +943,16 @@ class KoiosBackend(CardanoBackend):
         params = _json_object(max(dict_entries, key=_epoch_no_of, default={}))
         try:
             self._protocol_param = ProtocolParameters(
-                min_fee_constant=_json_int(params.get('min_fee_b'), 155381),
-                min_fee_coefficient=_json_int(params.get('min_fee_a'), 44),
+                min_fee_constant=_protocol_int(params.get('min_fee_b'), 155381, 0, 10_000_000),
+                min_fee_coefficient=_protocol_int(params.get('min_fee_a'), 44, 0, 10_000),
                 max_block_size=_json_int(params.get('max_block_size'), 90112),
-                max_tx_size=_json_int(params.get('max_tx_size'), 16384),
+                max_tx_size=_protocol_int(params.get('max_tx_size'), 16384, 256, 1_048_576),
                 max_block_header_size=_json_int(params.get('max_bh_size'), 1100),
-                key_deposit=_json_int(params.get('key_deposit'), 2000000),
-                pool_deposit=_json_int(params.get('pool_deposit'), 500000000),
+                key_deposit=_protocol_int(
+                    params.get('key_deposit'), 2_000_000, 0, 10_000_000_000),
+                pool_deposit=_protocol_int(
+                    params.get('pool_deposit'), 500_000_000, 0,
+                    10_000_000_000),
                 pool_influence=_json_fraction(params.get('influence'), Fraction(0)),
                 monetary_expansion=_json_fraction(
                     params.get('monetary_expand_rate'), Fraction(0)),
@@ -854,7 +984,8 @@ class KoiosBackend(CardanoBackend):
                      if isinstance(ops, list) else ops
                      for name, ops in _json_object(params.get('cost_models')).items()}),
                 coins_per_utxo_word=34482,
-                coins_per_utxo_byte=_json_int(params.get('coins_per_utxo_size'), 4310),
+                coins_per_utxo_byte=_protocol_int(
+                    params.get('coins_per_utxo_size'), 4310, 1, 100_000),
                 maximum_reference_scripts_size={"bytes": _json_int(
                     params.get('max_ref_script_size'), 16384)},
                 min_fee_reference_scripts={"base": _json_float(
@@ -864,7 +995,8 @@ class KoiosBackend(CardanoBackend):
         except Exception as e:
             logging.error(f"[protocol_param] Error mapping Koios protocol parameters:"
                           f" {e}", exc_info=True)
-            console.print(f"[red]Error mapping protocol parameters: {e}[/red]")
+            console.print(f"[red]Error mapping protocol parameters: "
+                  f"{_display_text(str(e))}[/red]")
             raise
         return self._protocol_param
 
@@ -1081,7 +1213,7 @@ class OgmiosBackend(CardanoBackend):
         if isinstance(result, dict):
             tx_obj = _json_object(result.get("transaction"))
             tx_id = tx_obj.get("id")
-            return tx_id if isinstance(tx_id, str) else None
+            return _returned_tx_id(tx_id)
         return result if isinstance(result, str) else None
 
     def health(self) -> dict[str, JSON]:
@@ -1110,7 +1242,8 @@ class OgmiosBackend(CardanoBackend):
             raw = self._rpc("queryLedgerState/protocolParameters")
         except Exception as e:
             logging.error(f"[protocol_param] Failed to fetch via Ogmios: {e}", exc_info=True)
-            console.print(f"[red]Failed to fetch protocol parameters from Ogmios: {e}[/red]")
+            console.print(f"[red]Failed to fetch protocol parameters from Ogmios: "
+                          f"{_display_text(str(e))}[/red]")
             raise
         params = _json_object(raw)
 
@@ -1135,22 +1268,31 @@ class OgmiosBackend(CardanoBackend):
 
         try:
             self._protocol_param = ProtocolParameters(
-                min_fee_coefficient=_json_int(
-                    _first('minFeeCoefficient', 'min_fee_a') or 44),
-                min_fee_constant=_extract_lovelace(
-                    _first('minFeeConstant', 'min_fee_b') or 155381),
+                min_fee_coefficient=_protocol_int(
+                    _first('minFeeCoefficient', 'min_fee_a') or 44, 44, 0, 10_000),
+                min_fee_constant=_protocol_int(
+                    _extract_lovelace(
+                        _first('minFeeConstant', 'min_fee_b') or 155381),
+                    155381, 0, 10_000_000),
                 max_block_size=_extract_bytes(
                     _first('maxBlockBodySize', 'max_block_size') or 90112),
-                max_tx_size=_extract_bytes(
-                    _first('maxTransactionSize', 'maxTxSize', 'max_tx_size') or 16384),
+                max_tx_size=_protocol_int(
+                    _extract_bytes(
+                        _first('maxTransactionSize', 'maxTxSize', 'max_tx_size')
+                        or 16384),
+                    16384, 256, 1_048_576),
                 max_block_header_size=_extract_bytes(
                     _first('maxBlockHeaderSize', 'max_block_header_size') or 1100),
-                key_deposit=_extract_lovelace(
-                    _first('stakeCredentialDeposit', 'stakeKeyDeposit', 'key_deposit')
-                    or 2000000),
-                pool_deposit=_extract_lovelace(
-                    _first('stakePoolDeposit', 'poolDeposit', 'pool_deposit')
-                    or 500000000),
+                key_deposit=_protocol_int(
+                    _extract_lovelace(
+                        _first('stakeCredentialDeposit', 'stakeKeyDeposit',
+                               'key_deposit') or 2_000_000),
+                    2_000_000, 0, 10_000_000_000),
+                pool_deposit=_protocol_int(
+                    _extract_lovelace(
+                        _first('stakePoolDeposit', 'poolDeposit', 'pool_deposit')
+                        or 500_000_000),
+                    500_000_000, 0, 10_000_000_000),
                 # Ogmios reports influences/expansions as exact rationals
                 # ("3/10"); Fraction parses them without float rounding. The
                 # transaction builder never reads these four fields.
@@ -1204,11 +1346,14 @@ class OgmiosBackend(CardanoBackend):
                 # the ledger requires min = (160 + output CBOR size) * this value per
                 # output. Mapping it as a word count (or dividing by 8) made the
                 # builder accept change outputs the ledger rejects (error 3125).
-                coins_per_utxo_word=_json_int(
-                    _first('coinsPerUtxoWord', 'coins_per_utxo_word') or 34482),
-                coins_per_utxo_byte=_extract_lovelace(
-                    _first('minUtxoDepositCoefficient', 'coinsPerUtxoByte',
-                           'coins_per_utxo_byte') or 4310),
+                coins_per_utxo_word=_protocol_int(
+                    _first('coinsPerUtxoWord', 'coins_per_utxo_word') or 34482,
+                    34482, 1, 100_000),
+                coins_per_utxo_byte=_protocol_int(
+                    _extract_lovelace(
+                        _first('minUtxoDepositCoefficient', 'coinsPerUtxoByte',
+                               'coins_per_utxo_byte') or 4310),
+                    4310, 1, 100_000),
                 cost_models=_ogmios_cost_models(params.get('plutusCostModels')),
                 maximum_reference_scripts_size={"bytes": _extract_bytes(
                     _first('maxReferenceScriptsSize', 'maximum_reference_scripts_size')
@@ -1218,7 +1363,8 @@ class OgmiosBackend(CardanoBackend):
             )
         except Exception as e:
             logging.error(f"[protocol_param] Error mapping Ogmios params: {e}", exc_info=True)
-            console.print(f"[red]Error mapping protocol parameters from Ogmios: {e}[/red]")
+            console.print(f"[red]Error mapping protocol parameters from Ogmios: "
+                          f"{_display_text(str(e))}[/red]")
             raise
         return self._protocol_param
 
@@ -1296,9 +1442,20 @@ BACKGROUND_COLOR = "black"
 # How long a multisig transaction stays valid while signatures are collected.
 # Cardano slots are one second on every network this program targets.
 DEFAULT_SIGNING_WINDOW_DAYS = 7
+# Upper bound on a .cbor this program will load: a native script is a few
+# hundred bytes and even a fully-witnessed transaction stays well under a
+# megabyte; anything bigger is not something this wallet understands.
+MAX_CBOR_FILE_BYTES = 10 * 1024 * 1024
+
 
 WALLET_DIR = "CardanoInterface/wallets"
 USER_DATA_DIR = "CardanoInterface/users"
+# Every wallet artifact is an encrypted secret or a record of the wallet's
+# funds, and this is a single-threaded TUI (no threading, sockets or
+# subprocesses anywhere in the module), so the process umask can pin the
+# whole tree owner-only — 0600 files, 0700 directories — whatever the login
+# shell's umask would have produced.
+os.umask(0o077)
 os.makedirs(WALLET_DIR, exist_ok=True)
 os.makedirs(USER_DATA_DIR, exist_ok=True)
 
@@ -1423,10 +1580,6 @@ class XMLParsingError(ParsingError):
 class BackendConfigurationError(Exception):
     """Raised when backend configuration is incorrect or missing."""
 
-class WalletDataGenerationError(Exception):
-    """Raised when wallet data generation fails."""
-    def __init__(self, message: str = "Wallet data generation error."):
-        super().__init__(message)
 
 def _copy_wrapper_metadata(func: Callable[P, R],
                            wrapper: Callable[P, R | None]) -> None:
@@ -1452,8 +1605,8 @@ def exception_error(func: Callable[P, R]) -> Callable[P, R | None]:
         try:
             return func(*args, **kwargs)
         except Exception as e:
-            from rich.markup import escape
-            console.print(f"[bold red]{type(e).__name__}: {escape(str(e))}[/bold red]")
+            console.print(f"[bold red]{type(e).__name__}: "
+                          f"{_rich_escape(str(e))}[/bold red]")
             # Log with traceback
             logging.error(f"Exception in {getattr(func, '__name__', 'wrapped')}: {e}",
                           exc_info=True)
@@ -1472,7 +1625,7 @@ def debug_backend_health() -> None:
         console.print(f"[green]{context.display_name()} health check passed.[/green]")
         console.print(result)
     except Exception as e:
-        console.print(f"[red]Health check failed: {e}[/red]")
+        console.print(f"[red]Health check failed: {_display_text(str(e))}[/red]")
     logging.debug("[EXIT] debug_backend_health()")
 
 def show_framed_banner(spin_times: int = 16, delay: float = 0.08) -> None:
@@ -1577,10 +1730,8 @@ def save_encrypted_wallet(wallet_dir: str, skey: SigningKey | ExtendedSigningKey
                 "Signing key serialization produced a non-byte payload.")
         encrypted_skey = encrypt_data(bytes(skey_prim), password)
         encrypted_stkey = encrypt_data(bytes(stkey_prim), password)
-        with open(os.path.join(wallet_dir, "payment.skey"), "wb") as f:
-            f.write(encrypted_skey)
-        with open(os.path.join(wallet_dir, "stake.skey"), "wb") as f:
-            f.write(encrypted_stkey)
+        _write_secret_bytes(os.path.join(wallet_dir, "payment.skey"), encrypted_skey)
+        _write_secret_bytes(os.path.join(wallet_dir, "stake.skey"), encrypted_stkey)
         payment_vkey = skey.to_verification_key()
         stake_vkey = stkey.to_verification_key()
         payment_hash = payment_vkey.hash()
@@ -1592,13 +1743,11 @@ def save_encrypted_wallet(wallet_dir: str, skey: SigningKey | ExtendedSigningKey
         )
         logging.debug(f"Address created: {address}")
         encrypted_address = encrypt_data(ensure_bytes(str(address)), password)
-        with open(os.path.join(wallet_dir, "address.enc"), "wb") as f:
-            f.write(encrypted_address)
+        _write_secret_bytes(os.path.join(wallet_dir, "address.enc"), encrypted_address)
         with open(os.path.join(wallet_dir, "network.txt"), "w") as f:
             f.write(SELECTED_NETWORK or "preprod")
     except Exception as e:
         logging.error(f"Failed to save encrypted wallet: {e}")
-        import traceback
         logging.error(traceback.format_exc())
         console.print(f"[red]Failed to save encrypted wallet: {e}[/red]")
         raise
@@ -1608,6 +1757,7 @@ def load_encrypted_wallet(wallet_dir: str, password: str) -> tuple[
         StakeExtendedSigningKey | StakeSigningKey]:
     """Fixed decryption handling"""
     try:
+        _harden_wallet_dir_modes(wallet_dir)
         with open(os.path.join(wallet_dir, "payment.skey"), "rb") as f:
             encrypted_skey = f.read()
         with open(os.path.join(wallet_dir, "stake.skey"), "rb") as f:
@@ -1644,14 +1794,14 @@ def load_encrypted_wallet(wallet_dir: str, password: str) -> tuple[
 def save_encrypted_mnemonic(wallet_dir: str, mnemonic: str, password: str) -> None:
     try:
         encrypted = encrypt_data(mnemonic.encode("utf-8"), password)
-        with open(os.path.join(wallet_dir, "mnemonic.enc"), "wb") as f:
-            f.write(encrypted)
+        _write_secret_bytes(os.path.join(wallet_dir, "mnemonic.enc"), encrypted)
     except Exception as e:
         console.print(f"[red]Failed to save encrypted mnemonic: {e}[/red]")
         raise
 
 def load_encrypted_mnemonic(wallet_dir: str, password: str) -> str:
     try:
+        _harden_wallet_dir_modes(wallet_dir)
         with open(os.path.join(wallet_dir, "mnemonic.enc"), "rb") as f:
             encrypted = f.read()
         decrypted = decrypt_data(encrypted, password)
@@ -1702,7 +1852,7 @@ def _refuse_wrong_network(wallet_name: str, wallet_dir: str, action: str) -> boo
     if mismatch is None:
         return False
     console.print(f"[red]{wallet_name} belongs to {mismatch}, but you are connected "
-                  f"to {SELECTED_NETWORK}. Reading {action} here would report "
+                  f"to {SELECTED_NETWORK}. {action} on this network would read "
                   "another chain's state at this wallet's address — switch "
                   f"networks first (Switch Backend, option {mismatch}).[/red]")
     return True
@@ -2231,99 +2381,115 @@ def regenerate_address(wallet_dir: str, password: str) -> Address:
     except Exception as e:
         raise RuntimeError(f"Failed to regenerate address: {e}") from e
 
+WALLET_NAME_RE = re.compile(r"^[a-zA-Z0-9_]+$")
+
+
 def secure_path_join(base: str, sub_path: JSON | str) -> str:
-    """
-    Joins a base path with a sub-path, ensuring that the sub_path is a string.
-    If sub_path is a dict, it converts the relevant part of it to a string.
+    """Join base with a single sub-path component, refusing any escape.
+
+    The sub-path is a wallet name: one filesystem component made of letters,
+    digits and underscores — the same rule every interactive door enforces on
+    typed names. Anything else (an absolute path, '..', an empty string, a
+    name with separators or newlines) is refused rather than joined, so no
+    caller can be steered outside `base` by a name that arrived from a file
+    the user did not type themselves.
     """
     # dict form carries the wallet name; anything else joins as a plain string
     sub_path_str = (_json_str(_json_object(sub_path).get("name"))
                     if isinstance(sub_path, dict) else str(sub_path))
+    if not WALLET_NAME_RE.fullmatch(sub_path_str):
+        raise ValueError(
+            f"Refusing unsafe wallet name: {sub_path_str!r}. Names are letters, "
+            "numbers and underscores only."
+        )
     return os.path.join(base, sub_path_str)
 
-@exception_error
-def ensure_wallet_files(wallet_dir: str, wallet_meta: dict[str, JSON],
-                        password: str) -> bool:
+
+def _harden_wallet_dir_modes(wallet_dir: str) -> None:
+    """Repair umask-default permissions written by older versions.
+
+    Every file in a wallet directory is either an encrypted secret or a
+    record of the wallet's funds, so the whole tree is owner-only: 0700
+    directories, 0600 files. Planted symlinks are named and skipped, never
+    followed into someone else's tree.
     """
-    Ensure that all required wallet files (keys, address, mnemonic) exist.
-    If any are missing, prompt the user to regenerate or import them.
-    Automatically create missing data if the user agrees.
+    try:
+        if os.path.islink(wallet_dir):
+            logging.warning(f"Wallet path is a symbolic link; not hardened: "
+                            f"{wallet_dir}")
+            return
+        os.chmod(wallet_dir, 0o700)
+        for root, dirs, files in os.walk(wallet_dir):
+            for d in dirs:
+                p = os.path.join(root, d)
+                if not os.path.islink(p):
+                    os.chmod(p, 0o700)
+            for fn in files:
+                p = os.path.join(root, fn)
+                if not os.path.islink(p):
+                    os.chmod(p, 0o600)
+    except OSError as e:
+        logging.warning(f"Could not harden wallet permissions on "
+                        f"{wallet_dir}: {e}")
+
+
+def _harden_data_tree() -> None:
+    """One startup pass making both data trees owner-only.
+
+    Wallets and user records created before permissions were pinned landed
+    umask-default (664/775); this walk repairs them, while new artifacts are
+    covered by the process umask set at import.
     """
-    required_files = [
-        "payment.skey",
-        "stake.skey",
-        "payment.vkey",
-        "stake.vkey",
-        "mnemonic.enc",
-        "address.enc"
-    ]
-    missing = []
-    for fname in required_files:
-        if not os.path.exists(os.path.join(wallet_dir, fname)):
-            missing.append(fname)
+    try:
+        os.chmod(WALLET_DIR, 0o700)
+        os.chmod(USER_DATA_DIR, 0o700)
+        # The data root one level up decides which trees these are: replacing
+        # a directory needs only write permission on its parent, so a
+        # group-writable root keeps the whole tree replaceable no matter what
+        # the tree itself allows. It is this program's own data directory, so
+        # it is repaired to owner-only like everything under it.
+        data_root = os.path.dirname(WALLET_DIR)
+        if data_root and os.path.isdir(data_root):
+            os.chmod(data_root, 0o700)
+        for name in os.listdir(WALLET_DIR):
+            p = os.path.join(WALLET_DIR, name)
+            if os.path.isdir(p) and not os.path.islink(p):
+                _harden_wallet_dir_modes(p)
+            elif os.path.isfile(p) and not os.path.islink(p):
+                os.chmod(p, 0o600)
+        for name in os.listdir(USER_DATA_DIR):
+            p = os.path.join(USER_DATA_DIR, name)
+            if os.path.isfile(p) and not os.path.islink(p):
+                os.chmod(p, 0o600)
+    except OSError as e:
+        logging.warning(f"Could not harden data-tree permissions: {e}")
 
-    if not missing:
-        console.print("[green]All required wallet files are present.[/green]")
-        return True  # All files exist
+USERNAME_RE = re.compile(r"^[a-zA-Z0-9]+$")
 
-    console.print(f"[yellow]Wallet '{wallet_meta.get('name', wallet_dir)}' is missing files:"
-        f"{missing}[/yellow]")
-    console.print("[bold]Would you like to automatically create the missing wallet data?"
-        "(yes/no)[/bold]")
-    while True:
-        choice = session.prompt("> ").strip().lower()
-        if choice in ("yes", "y"):
-            try:
-                console.print("[bold]Generating new wallet data...[/bold]")
-                mnemonic_phrase = generate_mnemonic()
-                payment_skey, stake_skey = derive_keys_from_mnemonic(mnemonic_phrase)
-                payment_vkey = payment_skey.to_verification_key()
-                stake_vkey = stake_skey.to_verification_key()
 
-                # Save generated data
-                save_encrypted_wallet(wallet_dir, payment_skey, stake_skey, password)
-                save_encrypted_mnemonic(wallet_dir, mnemonic_phrase, password)
-                payment_vkey.save(os.path.join(wallet_dir, "payment.vkey"))
-                stake_vkey.save(os.path.join(wallet_dir, "stake.vkey"))
+def _user_db_path(username: str) -> str:
+    """Path of a user's encrypted data file.
 
-                console.print("[green]Wallet data created successfully.[/green]")
-                return True
-            except ValueError as e:
-                console.print(f"[red]Value error during wallet creation: {e}[/red]")
-                raise WalletDataGenerationError(f"Value error: {e}") from e
-            except TypeError as e:
-                console.print(f"[red]Type error during wallet creation: {e}[/red]")
-                raise WalletDataGenerationError(f"Type error: {e}") from e
-            except FileNotFoundError as e:
-                console.print(f"[red]File not found during wallet creation: {e}[/red]")
-                raise WalletDataGenerationError(f"File not found: {e}") from e
-            except Exception as e:
-                console.print(f"[red]Unexpected error during wallet creation: {e}[/red]")
-                raise WalletDataGenerationError(f"Unexpected error: {e}") from e
-            finally:
-                console.print("[yellow]Attempted to create missing wallet data. Please verify the "
-                    "results.[/yellow]")
-        elif choice in ("no", "n"):
-            console.print("[yellow]Operation cancelled by user. Missing wallet data remains "
-                "unresolved.[/yellow]")
-            return False
-        else:
-            console.print("[red]Invalid option. Please type 'yes' or 'no'.[/red]")
+    A username is one filename component and is held to the same rule
+    registration enforces, so a path-shaped username can never redirect the
+    join outside USER_DATA_DIR.
+    """
+    if not USERNAME_RE.fullmatch(username):
+        raise ValueError(f"Refusing unsafe username: {username!r}")
+    return os.path.join(USER_DATA_DIR, f"{username}.userdb")
 
-@exception_error
+
 def save_user_data(username: str, data: dict[str, JSON], password: str) -> None:
     salt = os.urandom(16)
     key = derive_key(password, salt)
     f = Fernet(key)
     payload = json.dumps(data).encode("utf-8")
     encrypted = f.encrypt(payload)
-    user_file = os.path.join(USER_DATA_DIR, f"{username}.userdb")
-    with open(user_file, "wb") as file:
-        file.write(salt + encrypted)
+    _write_secret_bytes(_user_db_path(username), salt + encrypted)
 
 @exception_error
 def load_user_data(username: str, password: str) -> dict[str, JSON]:
-    user_file = os.path.join(USER_DATA_DIR, f"{username}.userdb")
+    user_file = _user_db_path(username)
     if not os.path.exists(user_file):
         raise FileNotFoundError(f"User data file for '{username}' not found.")
     with open(user_file, "rb") as file:
@@ -2353,7 +2519,7 @@ def user_register() -> tuple[str | None, str | None]:
         if not re.match(r'^[a-zA-Z0-9]+$', username):
             console.print("[red]Username must contain only letters and numbers.[/red]")
             continue
-        user_file = os.path.join(USER_DATA_DIR, f"{username}.userdb")
+        user_file = _user_db_path(username)
         if os.path.exists(user_file):
             console.print(f"[yellow]User '{username}' already exists.[/yellow]")
             console.print("[yellow]Please login instead or choose a different username.[/yellow]")
@@ -2373,7 +2539,11 @@ def user_register() -> tuple[str | None, str | None]:
 def user_login() -> tuple[str | None, str | None]:
     console.print("[bold green]User login[/bold green]")
     username = session.prompt("> ").strip()
-    user_file = os.path.join(USER_DATA_DIR, f"{username}.userdb")
+    try:
+        user_file = _user_db_path(username)
+    except ValueError:
+        console.print("[red]User not found. Please register first.[/red]")
+        return None, None
     if not os.path.exists(user_file):
         console.print("[red]User not found. Please register first.[/red]")
         return None, None
@@ -2381,13 +2551,13 @@ def user_login() -> tuple[str | None, str | None]:
     for _attempt in range(3):
         # Use the spinner-based prompt for password entry
         password = prompt_with_spinner("Enter your password", is_password=True)
-        try:
-            user_data = load_user_data(username, password)
-            if user_data:
-                console.print(f"[green]Welcome back, {username}![/green]")
-                return username, password
-        except Exception:
-            console.print("[red]Incorrect password. Please try again.[/red]")
+        # load_user_data never raises (its @exception_error wrapper prints and
+        # returns None), so failure is detected by the return value.
+        user_data = load_user_data(username, password)
+        if user_data is not None:
+            console.print(f"[green]Welcome back, {username}![/green]")
+            return username, password
+        console.print("[red]Incorrect password. Please try again.[/red]")
     console.print("[red]Too many failed attempts. Exiting.[/red]")
     sys.exit(1)
 
@@ -2434,8 +2604,14 @@ def wallet_create(current_user: str, user_password: str) -> None:
             continue
         break
 
-    console.print("[bold]Please enter your password to encrypt the wallet's signing keys:[/bold]")
-    password = prompt_existing_password()
+    # A wallet-encryption password is set once and guards the spending keys at
+    # rest, so it is asked like every new password: non-empty and confirmed.
+    # An empty one would make the at-rest key computable from the file itself.
+    password = _prompt_new_password(
+        "Please enter your password to encrypt the wallet's signing keys")
+    if password is None:
+        console.print("[yellow]Wallet creation cancelled.[/yellow]")
+        return
 
     mnemonic_phrase = generate_mnemonic()
     console.print("\n[bold green]IMPORTANT: Save your 24-word mnemonic securely![/bold green]")
@@ -2501,7 +2677,6 @@ def wallet_create(current_user: str, user_password: str) -> None:
 
     except Exception as e:
         logging.error(f"Wallet creation failed: {e}")
-        import traceback
         logging.error(traceback.format_exc())
         console.print(f"[red]Wallet creation failed: {e}[/red]")
         shutil.rmtree(wallet_dir, ignore_errors=True)
@@ -2568,8 +2743,11 @@ def wallet_import(current_user: str, user_password: str) -> None:
             console.print("[red]Invalid mnemonic phrase. Import aborted.[/red]")
             return
 
-        console.print("[bold]Enter your password to encrypt the wallet's signing keys:[/bold]")
-        password = prompt_existing_password()
+        password = _prompt_new_password(
+            "Enter your password to encrypt the wallet's signing keys")
+        if password is None:
+            console.print("[yellow]Wallet import cancelled.[/yellow]")
+            return
 
         # Created only once the mnemonic has validated: an abort above must not
         # leave an empty wallet dir squatting on the name.
@@ -2602,6 +2780,10 @@ def wallet_import(current_user: str, user_password: str) -> None:
         except Exception as e:
             console.print(f"[red]Import failed: {e}[/red]")
             shutil.rmtree(wallet_dir, ignore_errors=True)
+            # The directory is gone, so the wallet must not be registered
+            # below — a phantom entry would name a directory that does not
+            # exist, breaking delete and offer regeneration on a ghost.
+            return
 
     else:
         console.print("[yellow]You will need to provide the full paths to your encrypted payment "
@@ -2619,8 +2801,11 @@ def wallet_import(current_user: str, user_password: str) -> None:
 
         console.print("[bold]Enter your password to decrypt these keys:[/bold]")
         password_old = prompt_existing_password()
-        console.print("[bold]Enter your password to encrypt the wallet's signing keys:[/bold]")
-        password_new = prompt_existing_password()
+        password_new = _prompt_new_password(
+            "Enter your password to encrypt the wallet's signing keys")
+        if password_new is None:
+            console.print("[yellow]Wallet import cancelled.[/yellow]")
+            return
 
         try:
             with open(payment_skey_path, "rb") as f:
@@ -2787,7 +2972,11 @@ def _personal_wallet_entries(current_user: str,
         name = _json_str(_json_object(w).get("name"))
         if not name:
             continue
-        wallet_dir = secure_path_join(WALLET_DIR, name)
+        try:
+            wallet_dir = secure_path_join(WALLET_DIR, name)
+        except ValueError:
+            logging.warning(f"Skipping wallet entry with unsafe name: {name!r}")
+            continue
         # A multisig wallet holds a script, not a signing key, so it can never
         # be the identity that signs.
         if os.path.exists(os.path.join(wallet_dir, "mnemonic.enc")):
@@ -2826,6 +3015,42 @@ def _wallet_cosigner_key_hashes(wallet_dir: str, password: str) -> dict[str, byt
         # signer from signing.
         logging.warning(f"Could not cache cosigner key hashes for {wallet_dir}: {e}")
     return candidates
+
+
+def _verified_cosigner_key_hashes(
+        wallet_name: str, wallet_dir: str) -> dict[str, bytes] | None:
+    """Key hashes proven against the wallet's own keys, for publication.
+
+    The key-hash cache in the wallet directory is public, unauthenticated
+    state: it makes identity questions cheap, but its bytes are only a hint.
+    Where a hash is about to cross machines — shown for sending to a wallet
+    creator, or embedded in a new permanent script — it is re-derived under
+    the wallet's password instead: cache entries the wallet's keys do not
+    produce are dropped with a warning, and the rewritten cache carries only
+    the verified set. Returns None if the password was given up on.
+    """
+    cached = _read_cosigner_key_hash_cache(wallet_dir)
+    verified = _prompt_wallet_password(wallet_name, wallet_dir,
+                                       _wallet_cosigner_key_hashes)
+    if verified is None:
+        return None
+    derived = verified[1]
+    if cached:
+        foreign = {label: kh for label, kh in cached.items()
+                   if kh not in derived.values()}
+        if foreign:
+            console.print("[bold red]This wallet's stored key-hash cache "
+                          "named hashes its own keys do not produce:"
+                          "[/bold red]")
+            for label, kh in foreign.items():
+                console.print(f"  {kh.hex()}  [dim]({label})[/dim]")
+            console.print("[yellow]They are not shown or published, and the "
+                          "cache has been rewritten with the verified "
+                          "hashes. If you did not edit that file yourself, "
+                          "ask who can write to this wallet directory — "
+                          "publishing a foreign hash would make someone else "
+                          "a cosigner in your place.[/yellow]")
+    return derived
 
 
 class CosignerIdentity(TypedDict):
@@ -2900,14 +3125,17 @@ def _match_cosigner_identities(current_user: str, user_password: str,
 def _prompt_cosigner_key_hash(index: int,
                               already: list[bytes],
                               current_user: str,
-                              user_password: str) -> tuple[bytes, str | None] | None:
+                              user_password: str) -> tuple[bytes, str | None, bool] | None:
     """Collect one cosigner's key hash.
 
     A key hash is the only cosigner material that may cross machines, so this is
     all the creator ever asks for. The cosigner gets theirs from "Show My
     Cosigner Key" on their own machine.
 
-    Returns (key_hash, label_or_None), or None if cancelled.
+    Returns (key_hash, label_or_None, from_me), or None if cancelled. from_me
+    is True only for the 'me' picker, whose hash was proven under the owning
+    wallet's password — a pasted hash's label is display text and never
+    evidence that this machine holds the key.
     """
     while True:
         console.print(f"\n[bold]Cosigner {index + 1}[/bold]")
@@ -2928,7 +3156,7 @@ def _prompt_cosigner_key_hash(index: int,
                               f"{already.index(key_hash) + 1}.[/red]")
                 continue
             console.print(f"[green]Cosigner {index + 1} is you ({label}).[/green]")
-            return key_hash, label
+            return key_hash, label, True
 
         cleaned = answer.lower().removeprefix("0x")
         try:
@@ -2950,7 +3178,7 @@ def _prompt_cosigner_key_hash(index: int,
             "Only stored on this machine, so the wallet shows a name instead of a hash.",
         )
         console.print(f"[green]Cosigner {index + 1} accepted.[/green]")
-        return key_hash, (name or None)
+        return key_hash, (name or None), False
 
 
 def _pick_own_cosigner_key(current_user: str,
@@ -2977,13 +3205,11 @@ def _pick_own_cosigner_key(current_user: str,
         return None
     wallet_name, wallet_dir = wallets[choice]
 
-    candidates = _read_cosigner_key_hash_cache(wallet_dir)
-    if not candidates:
-        verified = _prompt_wallet_password(wallet_name, wallet_dir,
-                                           _wallet_cosigner_key_hashes)
-        if verified is None:
-            return None
-        candidates = verified[1]
+    # This hash becomes a permanent member of a new script, so it is proven
+    # under the wallet's password rather than read from the editable cache.
+    candidates = _verified_cosigner_key_hashes(wallet_name, wallet_dir)
+    if candidates is None:
+        return None
 
     # Both standards are derivable from the same wallet. For a script this
     # program creates, the personal-wallet path is the one its own signing flow
@@ -3365,13 +3591,14 @@ def multisig_wallet_create(current_user: str, user_password: str) -> None:
         if result is None:
             console.print("[yellow]Cancelled.[/yellow]")
             return
-        key_hash, label = result
+        key_hash, label, from_me = result
         if label:
             labels[key_hash] = label
-        # "me" resolves to a wallet on this machine, which is also what tells
-        # the wallet which cosigner this node is.
-        if label and any(label == name for name, _ in
-                         _personal_wallet_entries(current_user, user_password)):
+        # Only the 'me' picker proves the hash belongs to a wallet on this
+        # machine (verified under that wallet's password). A pasted hash's
+        # label matching a local wallet name is coincidence, not provenance,
+        # and must never make this node claim a key it does not hold.
+        if from_me:
             our_key_hash = key_hash
             self_cosigner_index = i
         key_hashes.append(key_hash)
@@ -3528,6 +3755,7 @@ def _load_multisig_wallet(wallet_dir: str) -> MultisigWalletInfo:
     change who this program believes may sign. config.json supplies only policy
     that the script cannot carry: names, provenance, and the signing window.
     """
+    _harden_wallet_dir_modes(wallet_dir)
     config_path = os.path.join(wallet_dir, "config.json")
     with open(config_path) as f:
         config = _json_object(_json_loads(f.read()))
@@ -3690,6 +3918,9 @@ def build_multisig_transaction(wallet_dir: str, recipient: str, amount_lovelace:
                          f" {format_ada(total_available)} available.")
 
     recipient_address: Address = Address.from_primitive(recipient)
+    # A build on this session's network can only pay addresses on it — the
+    # same refusal a cosigner's relay import applies to received bodies.
+    _refuse_foreign_network_address(recipient_address)
     token_multi_asset: MultiAsset | None = None
     if sweep:
         token_multi_asset = total_value.multi_asset or None
@@ -3853,6 +4084,10 @@ def build_multisig_transaction(wallet_dir: str, recipient: str, amount_lovelace:
         f.write(unsigned_cbor_hex)
     with open(os.path.join(session_dir, "unsigned_text_envelope.json"), "w") as f:
         f.write(text_envelope)
+    # Provenance marker for the sign door: this unsigned.cbor was built here
+    # from the wallet's own script inputs, so it may be signed offline. A
+    # session without it must have its inputs verified on chain first.
+    open(os.path.join(session_dir, "local_build"), "w").close()
     sent_assets: list[JSON] = [
         {"policy": policy.hex(), "name": name.hex(), "quantity": quantity}
         for policy, name, quantity in (assets or [])]
@@ -4051,6 +4286,21 @@ def build_multisig_stake_transaction(wallet_dir: str, pool_id: str | None = None
             "one, is the only way."
         )
 
+    # A foreign script stake credential (a provider's address whose staking
+    # part is some other script) cannot be witnessed by this wallet's
+    # signatures — the certificates would confirm but delegate nothing, while
+    # reporting success and consuming the deposit and fee. Only this wallet's
+    # own script as the stake credential is a delegation this wallet can make.
+    stored_address: Address = Address.from_primitive(script_address)
+    if stored_address.staking_part != ScriptHash(wallet["script_hash"]):
+        raise ValueError(
+            "This wallet's address stakes under a different credential than "
+            "this wallet's script, so its signatures cannot authorize any "
+            "stake certificate for it. The funds' stake credential belongs to "
+            "whoever built that address; this program will not build a "
+            "certificate it cannot make effective."
+        )
+
     stake_credential = StakeCredential(ScriptHash(wallet["script_hash"]))
     certificates: list[Certificate] = []
     actions: list[str] = []
@@ -4105,6 +4355,8 @@ def build_multisig_stake_transaction(wallet_dir: str, pool_id: str | None = None
     }
     with open(os.path.join(session_dir, "unsigned_text_envelope.json"), "w") as f:
         f.write(_dumps_json(envelope))
+    # Provenance marker for the sign door, as in build_multisig_transaction.
+    open(os.path.join(session_dir, "local_build"), "w").close()
 
     summary: dict[str, JSON] = {
         "wallet_name": config.get("name"),
@@ -4169,6 +4421,18 @@ def _multisig_signer_directory(wallet: MultisigWalletInfo,
         if witness_set is not None:
             attached = _witness_scripts(witness_set)
             if attached:
+                # An attached script says who may sign — but only this wallet's
+                # own script gets to say so here. Any script can be attached to
+                # any body by whoever built it; letting a foreign one author
+                # the displayed threshold and cosigner list would put the very
+                # claims the review exists to check under the sender's control.
+                if script_hash_from_script(attached[0]) != wallet["script_hash"]:
+                    raise ValueError(
+                        "The script attached to this transaction is not this "
+                        "wallet's script, so it cannot say who may sign it. The "
+                        "file belongs to a different wallet, or it was not built "
+                        "from this wallet's script."
+                    )
                 script = attached[0]
     if script is None:
         script = wallet["script"]
@@ -4245,8 +4509,14 @@ def _our_cosigner_indices(current_user: str, user_password: str,
     indices = {m["script_index"] for m in _match_cosigner_identities(
         current_user, user_password, wallet["key_hashes"])}
     if not indices:
+        # The recorded claim is honoured only while the wallet it names still
+        # exists on this machine; a claim whose wallet is gone is stale, not
+        # authority — it must not satisfy the initiator check on its own.
         claimed = wallet["config"].get("claimed_signer_index")
-        if claimed is not None:
+        signer_name = _json_str(wallet["config"].get("signer_wallet"))
+        personal = {name for name, _d in _personal_wallet_entries(
+            current_user, user_password)}
+        if claimed is not None and signer_name and signer_name in personal:
             indices.add(_json_int(claimed, -1))
     return indices
 
@@ -4324,6 +4594,66 @@ def _verify_witness(witness: VerificationKeyWitness, body_hash: bytes) -> bool:
 
 
 @exception_error
+def _script_input_index(script_address: str) -> dict[tuple[bytes, int], int] | None:
+    """Unspent outputs at this script address, as (tx hash, index) -> lovelace.
+
+    None means the chain could not be asked at all (no backend configured, or
+    the query failed). Callers must treat that as "cannot verify", never as
+    "verified empty".
+    """
+    if not context:
+        return None
+    try:
+        utxos = context.utxos(script_address)
+    except Exception as e:
+        logging.warning(f"Script-address UTxO query failed: {e}")
+        return None
+    index: dict[tuple[bytes, int], int] = {}
+    for utxo in utxos:
+        index[(utxo.input.transaction_id.payload, utxo.input.index)] = (
+            utxo.output.amount.coin)
+    return index
+
+
+def _verify_script_spend(wallet: MultisigWalletInfo, tx_body: TransactionBody,
+                         externally_supplied: bool
+                         ) -> tuple[str | None, dict[tuple[bytes, int], int], bool]:
+    """Refusal reason unless every input of this body is the wallet's own fund.
+
+    A signature authorizes exactly the inputs of the body it signs, so a body
+    whose inputs are not UTxOs of this wallet's script address is not a
+    multisig spend of this wallet at all — signing it would hand over a valid
+    key witness for whatever those inputs actually spend (a personal wallet,
+    for instance, whose funds the script never protected). The review screen
+    says the funds come from the script address; this check is what makes that
+    sentence true.
+
+    Returns (refusal_or_None, per_input_lovelace, verified_on_chain). When the
+    chain cannot be asked, a body this program did not build (a relay import
+    or a received package) is refused — an unverified provenance claim is not
+    a substitute for the check — while a session built by this program may
+    still sign offline, since its inputs were selected from the script address
+    at build time.
+    """
+    live = _script_input_index(wallet["script_address"])
+    if live is None:
+        if externally_supplied:
+            return ("The backend is unreachable, so this transaction's inputs "
+                    "could not be checked against the wallet's script address. "
+                    "Refusing to sign: an imported transaction must be "
+                    "verifiable as a spend of this wallet's own funds.", {}, False)
+        return (None, {}, False)
+    for inp in _tx_body_inputs(tx_body):
+        if (inp.transaction_id.payload, inp.index) not in live:
+            return (f"Input {inp.transaction_id.payload.hex()[:16]}...#{inp.index} "
+                    "is not an unspent output of this wallet's script address, so "
+                    "this is not a spend of the multisig's funds. A signature "
+                    "here would authorize those inputs directly — ask the sender "
+                    "for the transaction that spends the multisig address.",
+                    live, True)
+    return (None, live, True)
+
+
 def sign_multisig_transaction(wallet_dir: str, unsigned_cbor_hex: str | None = None,
                               session_dir: str | None = None, password: str | None = None,
                               signer_wallet_dir: str | None = None,
@@ -4372,6 +4702,20 @@ def sign_multisig_transaction(wallet_dir: str, unsigned_cbor_hex: str | None = N
     unsigned_tx = Transaction.from_cbor(unsigned_cbor_hex)
     tx_body = unsigned_tx.transaction_body
 
+    # Provenance: the review asserts these inputs spend the wallet's script
+    # funds, so that is proven before anything is displayed or signed. A
+    # session this program built carries a marker (its inputs were selected
+    # from the script address at build time); anything else — a relay import
+    # or a received package — must verify against the live chain.
+    locally_built = (session_dir is not None
+                     and os.path.exists(os.path.join(session_dir, "local_build")))
+    spend_refusal, input_lovelace, inputs_verified = _verify_script_spend(
+        wallet, tx_body, externally_supplied=not locally_built)
+    if spend_refusal is not None:
+        console.print(f"\n[bold red]{spend_refusal}[/bold red]")
+        console.print("[yellow]Nothing was signed.[/yellow]")
+        return None
+
     script_key_hashes, cosigner_names, threshold = _multisig_signer_directory(
         wallet, unsigned_tx
     )
@@ -4383,9 +4727,26 @@ def sign_multisig_transaction(wallet_dir: str, unsigned_cbor_hex: str | None = N
     # supposed to make plain.
     already_signed = _collected_signature_hashes(session_dir) if session_dir else set()
     incoming_witnesses = unsigned_tx.transaction_witness_set
+    verified_incoming: list[VerificationKeyWitness] = []
     if incoming_witnesses is not None and incoming_witnesses.vkey_witnesses:
+        # A relay carrier's witness list is the sender's claim about who has
+        # signed. Membership plus ed25519 verification against THIS body is
+        # what makes the claim true — the same two checks import_partial and
+        # assemble apply — so an unverifiable witness is neither counted nor
+        # forwarded, never silently passed to the next cosigner.
+        incoming_body_hash = tx_body.hash()
         for w in _witness_vkeys(incoming_witnesses):
-            already_signed.add(key_hash_from_vkey(w.vkey.payload))
+            kh = key_hash_from_vkey(w.vkey.payload)
+            if (kh in script_key_hashes
+                    and not _verify_witness(w, incoming_body_hash)):
+                console.print(
+                    f"[bold red]The signature carried for cosigner "
+                    f"{_display_text(cosigner_names.get(kh, kh.hex()[:16]))} "
+                    "does not verify against this transaction body — it will "
+                    "not be counted or forwarded.[/bold red]")
+                continue
+            verified_incoming.append(w)
+            already_signed.add(kh)
     already_signed &= set(script_key_hashes)
 
     # ── Display comprehensive transaction review ─────────────────────────
@@ -4398,12 +4759,19 @@ def sign_multisig_transaction(wallet_dir: str, unsigned_cbor_hex: str | None = N
     console.print(f"\n  [bold]Transaction ID:[/bold] {tx_body.id.payload.hex()}")
     console.print(f"  [bold]Fee:[/bold] {format_ada(tx_body.fee)} ADA")
 
-    # Inputs with full address context
-    total_input = 0
+    # Inputs with resolved amounts and verified provenance
     console.print("\n  [bold underline]Inputs (source of funds):[/bold underline]")
     for inp in _tx_body_inputs(tx_body):
-        console.print(f"    TX {inp.transaction_id.payload.hex()[:64]}#{inp.index}")
-    console.print("  [dim]  (from multisig script address)[/dim]")
+        lovelace = input_lovelace.get((inp.transaction_id.payload, inp.index))
+        amount_note = f" — {format_ada(lovelace)} ADA" if lovelace is not None else ""
+        console.print(f"    TX {inp.transaction_id.payload.hex()[:64]}#{inp.index}"
+                      f"{amount_note}")
+    if inputs_verified:
+        console.print("  [green]  (every input verified on chain as an unspent "
+                      "output of this wallet's script address)[/green]")
+    else:
+        console.print("  [yellow]  (built by this program; inputs not re-checked "
+                      "because the backend is unreachable)[/yellow]")
 
     # Outputs with role labels (destination vs change)
     script_addr_str = wallet.get("script_address", "")
@@ -4411,7 +4779,6 @@ def sign_multisig_transaction(wallet_dir: str, unsigned_cbor_hex: str | None = N
     for i, out in enumerate(tx_body.outputs):
         addr_str = str(out.address)
         lovelace = out.amount.coin
-        total_input += lovelace
         is_change = addr_str == script_addr_str
         role = ("[cyan]CHANGE (back to multisig)[/cyan]" if is_change
                 else "[yellow]DESTINATION[/yellow]")
@@ -4422,7 +4789,8 @@ def sign_multisig_transaction(wallet_dir: str, unsigned_cbor_hex: str | None = N
             for policy_bytes, assets in _multi_asset_items(out.amount.multi_asset):
                 for asset_bytes, qty in assets:
                     console.print(f"       Token:   {policy_bytes.hex()[:16]}..."
-                                  f"{_asset_display_name(asset_bytes)[:24]} x{qty}")
+                                  f"{_display_text(_asset_display_name(asset_bytes)[:24])}"
+                                  f" x{qty}")
 
     # Who can sign, and who already has
     console.print("\n  [bold underline]Signing requirements:[/bold underline]")
@@ -4431,13 +4799,16 @@ def sign_multisig_transaction(wallet_dir: str, unsigned_cbor_hex: str | None = N
     console.print("  [bold]Cosigners in this script:[/bold]")
     for kh in script_key_hashes:
         mark = "[green]✓ signed[/green]" if kh in already_signed else "[yellow]○ pending[/yellow]"
-        console.print(f"      {mark}  {cosigner_names.get(kh, 'unknown')}: {kh.hex()[:16]}...")
+        console.print(f"      {mark}  "
+                      f"{_display_text(cosigner_names.get(kh, 'unknown'))}: "
+                      f"{kh.hex()[:16]}...")
 
     # Authorization explanation
     console.print("\n  [bold underline]What your signature authorizes:[/bold underline]")
     console.print("    By signing, you authorize the script to release funds from")
-    console.print(f"    the multisig wallet '{config.get('name', wallet_dir)}' on "
-        f"{config.get('network', 'unknown')}.")
+    console.print(f"    the multisig wallet "
+                  f"'{_display_text(_json_str(config.get('name'), wallet_dir))}' on "
+                  f"{_display_text(_json_str(config.get('network'), 'unknown'))}.")
     console.print("    This action [bold red]CANNOT[/bold red] be undone once the "
         "transaction is submitted.")
     console.print("    Only sign if you have verified the destination and amounts above.")
@@ -4504,7 +4875,9 @@ def sign_multisig_transaction(wallet_dir: str, unsigned_cbor_hex: str | None = N
                       "standards.)[/dim]")
         console.print("  Script expects:")
         for kh in script_key_hashes:
-            console.print(f"    {kh.hex()}  [dim]({cosigner_names.get(kh, 'unknown')})[/dim]")
+            console.print(f"    {kh.hex()}  "
+                      f"[dim]({_display_text(cosigner_names.get(kh, 'unknown'))})"
+                      f"[/dim]")
         console.print("\n[yellow]A signature from this wallet would be rejected, "
                       "so nothing was written.[/yellow]")
         console.print("[dim]If you are a cosigner, try the wallet whose key hash you "
@@ -4516,9 +4889,11 @@ def sign_multisig_transaction(wallet_dir: str, unsigned_cbor_hex: str | None = N
 
     matched_cosigner_index = script_key_hashes.index(our_key_hash)
     cosigner_label = cosigner_names.get(our_key_hash, f"cosigner_{matched_cosigner_index}")
+    display_label = _display_text(cosigner_label)
 
     if our_key_hash in already_signed:
-        console.print(f"\n[yellow]{cosigner_label} has already signed this transaction.[/yellow]")
+        console.print(f"\n[yellow]{display_label} has already signed this "
+                      "transaction.[/yellow]")
         console.print("[yellow]Re-signing replaces that signature with an equivalent one.[/yellow]")
 
     signature = signing_key.sign(tx_body.hash())
@@ -4533,8 +4908,9 @@ def sign_multisig_transaction(wallet_dir: str, unsigned_cbor_hex: str | None = N
         prior_vkeys: list[VerificationKeyWitness] = []
         ws = unsigned_tx.transaction_witness_set
         if ws and ws.vkey_witnesses:
-            # drop any stale copy of our own signature, keep everyone else's
-            prior_vkeys = [w for w in _witness_vkeys(ws)
+            # drop any stale copy of our own signature, keep everyone else's —
+            # only the witnesses that verified against this body above
+            prior_vkeys = [w for w in verified_incoming
                            if key_hash_from_vkey(w.vkey.payload) != our_key_hash]
         merged_vkeys = prior_vkeys + [vk_witness]
         witness_set = TransactionWitnessSet(
@@ -4584,7 +4960,7 @@ def sign_multisig_transaction(wallet_dir: str, unsigned_cbor_hex: str | None = N
     collected = _collected_signature_hashes(session_dir)
     _write_session_status(session_dir, collected, threshold)
 
-    console.print(f"\n[bold green]Signed as {cosigner_label}.[/bold green]")
+    console.print(f"\n[bold green]Signed as {display_label}.[/bold green]")
     console.print(f"  Signatures now collected: {len(collected)} of {threshold}")
     console.print(f"  Your partial: [cyan]{os.path.join(session_dir, partial_name)}[/cyan]")
     if len(collected) >= threshold:
@@ -4649,9 +5025,19 @@ def restore_multisig_participation(wallet_dir: str, current_user: str,
         console.print(f"[dim]{len(matches)} of your wallets are cosigners of this "
                       "script; recording the first.[/dim]")
 
-    config["claimed_signer_index"] = match["script_index"]
-    config["signer_wallet"] = match["wallet_name"]
-    _dump_json(config, os.path.join(wallet_dir, "config.json"))
+    # The durable claim (claimed_signer_index gates who may initiate) is only
+    # recorded from a match proven under a wallet password. A cache-only
+    # match is displayed but not persisted: the cache is editable state, and
+    # a tampered entry must not be able to write itself into config.json.
+    if unlock_password is not None:
+        config["claimed_signer_index"] = match["script_index"]
+        config["signer_wallet"] = match["wallet_name"]
+        _dump_json(config, os.path.join(wallet_dir, "config.json"))
+    else:
+        console.print("[dim]Matched against this machine's cached key hashes. "
+                      "Nothing was recorded — unlock the wallet (the retry "
+                      "asks for its password) to record your cosigner "
+                      "position durably.[/dim]")
 
     console.print(f"\n[bold green]You are cosigner {match['script_index'] + 1} of this "
                   f"wallet.[/bold green]")
@@ -4743,6 +5129,49 @@ def _script_address_balances(script_hash_bytes: bytes) -> dict[str, int]:
     return balances
 
 
+def _refuse_foreign_network_address(supplied: Address) -> None:
+    """Refuse an address from another network than this session.
+
+    Nothing built on this session's chain can pay or watch an address that
+    belongs to another one. For a recovery, a wallet built from such an
+    address would record this session's network in network.txt while its
+    funds sit where the address points — a disagreement the network guard can
+    never see (it reads network.txt), and every balance query on this backend
+    would read as empty. For a spend recipient, the transaction would either
+    be rejected by the ledger or strand the funds at an address no wallet on
+    this network shows.
+    """
+    if supplied.network == current_network():
+        return
+    addr_net = "mainnet" if supplied.network == Network.MAINNET \
+        else "testnet (preprod or preview)"
+    raise ValueError(
+        f"That address belongs to {addr_net}, but you are connected to "
+        f"{SELECTED_NETWORK or 'preprod'}. Nothing that points there can be "
+        "built or recovered on this network — switch networks first "
+        f"(Switch Backend) if this is really where the funds should go."
+    )
+
+
+def _backend_reachable() -> bool:
+    """True when the backend answers a trivial chain query right now.
+
+    Every backend's _utxos maps a connection failure to an empty list, so a
+    balance of zero cannot tell 'the chain said zero' from 'the chain could
+    not be asked'. Chain-decided choices must not guess on that difference.
+    """
+    if not context:
+        return False
+    try:
+        # Reading the tip property performs the network probe; the value
+        # itself is not needed, only whether the backend answers at all.
+        _tip = context.last_block_slot
+        return True
+    except Exception as e:
+        logging.warning(f"Backend reachability probe failed: {e}")
+        return False
+
+
 def _choose_script_reading(
         readings: list[tuple[str, NativeScript]], known_address: str | None,
         staking: bool | None) -> tuple[str, NativeScript, bool | None, str | None]:
@@ -4762,6 +5191,7 @@ def _choose_script_reading(
         label, script = readings[0]
         if known_address:
             supplied: Address = Address.from_primitive(known_address)
+            _refuse_foreign_network_address(supplied)
             if not isinstance(supplied.payment_part, ScriptHash):
                 raise ValueError("That address is not a script address, so it "
                                  "cannot belong to this script.")
@@ -4778,6 +5208,7 @@ def _choose_script_reading(
         # More than one reading: the file is version-wrapped, and the bytes
         # alone cannot say which tree the funds belong to.
         supplied = Address.from_primitive(known_address)
+        _refuse_foreign_network_address(supplied)
         if not isinstance(supplied.payment_part, ScriptHash):
             raise ValueError("That address is not a script address, so it cannot "
                              "belong to this script.")
@@ -4793,6 +5224,18 @@ def _choose_script_reading(
             "it cannot belong to the wallet in it."
         )
 
+    # The funded probe below asks the chain which reading holds the money. An
+    # unreachable backend would make every balance read zero — an outage must
+    # be refused, not presented as a chain-verified empty wallet (the same
+    # cannot-ask-is-not-verified rule _verify_script_spend applies).
+    if not _backend_reachable():
+        raise ValueError(
+            "The backend is unreachable, so the chain cannot be asked which "
+            "address this wallet's funds sit at. Nothing was recovered. Try "
+            "again when the backend is back, or recover again giving the "
+            "exact address your funds sit at."
+        )
+
     funded_readings: list[tuple[str, NativeScript, str]] = []
     for label, script in readings:
         hash_bytes = script_hash_from_script(script)
@@ -4802,6 +5245,15 @@ def _choose_script_reading(
                 console.print(f"[dim]{label} — {candidate_label}: "
                               f"{format_ada(balances[candidate])} ADA[/dim]")
         funded = [a for a, lovelace in balances.items() if lovelace > 0]
+        if len(funded) > 1:
+            # One script, two funded address shapes (enterprise and base):
+            # picking either silently would hide the other's funds from every
+            # later balance and sweep, so the exact address is required.
+            raise ValueError(
+                "Both address shapes of this script hold funds on chain, so "
+                "the wallet cannot be chosen for you. Recover again and give "
+                f"the exact address your funds sit at. ({'; '.join(funded)})"
+            )
         if funded:
             funded_readings.append((label, script, funded[0]))
     if len(funded_readings) == 1:
@@ -5320,10 +5772,15 @@ def export_transaction_package(wallet_dir: str, session_dir: str,
         for w in _witness_vkeys(tx.transaction_witness_set):
             signatures_collected.append(key_hash_from_vkey(w.vkey.payload).hex())
 
-    threshold = _json_int(config.get("threshold"), 1)
+    # These claims cross machines and gate what receiving cosigners believe;
+    # they are derived from the script (the wallet's authority) and the
+    # wallet's own recorded network, never from config.json — a hand-edited
+    # or stale config must not be able to understate a threshold or mislabel
+    # the network inside a package other people act on.
+    threshold = wallet["threshold"]
     signatures_needed = max(0, threshold - len(signatures_collected))
 
-    network = _json_str(config.get("network"), SELECTED_NETWORK or "preprod")
+    network = load_wallet_network(wallet_dir) or SELECTED_NETWORK or "preprod"
     testnet_magic = "1" if network == "preprod" else "2" if network == "preview" else ""
 
     text_envelope_type = ("Witnessed Tx BabbageEra" if stage == "final"
@@ -5508,17 +5965,40 @@ def _import_wallet_checkpoint(package: dict[str, JSON], current_user: str,
 
     config = _json_object(package.get("config"))
     wallet_name = _json_str(config.get("name"), f"restored_{script_hash_actual[:8]}")
+    if not WALLET_NAME_RE.fullmatch(wallet_name):
+        # The name names a directory and is excluded from the checkpoint's
+        # admin signature, so it is held to the same rule as a typed name
+        # instead of being trusted from the file.
+        console.print(f"[yellow]The checkpoint's wallet name "
+                      f"{_display_text(wallet_name)!r} is "
+                      "not a safe directory name; using a name derived from the "
+                      "script instead.[/yellow]")
+        wallet_name = f"restored_{script_hash_actual[:8]}"
     wallet_dir = secure_path_join(WALLET_DIR, wallet_name)
 
     if os.path.exists(wallet_dir):
         existing_hash_path = os.path.join(wallet_dir, "script_hash")
-        if os.path.exists(existing_hash_path):
-            with open(existing_hash_path) as f:
-                existing_hash = f.read().strip()
-            if existing_hash != script_hash_actual:
-                raise ValueError(f"A different wallet already exists at {wallet_name}.")
+        # A checkpoint may only restore over a multisig wallet of the SAME
+        # script. A directory without script_hash is a personal wallet, and
+        # one holding personal secret files is any wallet this restore must
+        # not touch: overwriting it would rewrite its network record and
+        # plant multisig identity files beside its keys.
+        personal_secrets = [
+            name for name in ("payment.skey", "address.enc", "mnemonic.enc")
+            if os.path.exists(os.path.join(wallet_dir, name))
+        ]
+        if not os.path.exists(existing_hash_path) or personal_secrets:
+            raise ValueError(
+                f"A wallet called '{wallet_name}' already exists and is not a "
+                "multisig wallet this checkpoint can restore over. Import the "
+                "checkpoint under a different name."
+            )
+        with open(existing_hash_path) as f:
+            existing_hash = f.read().strip()
+        if existing_hash != script_hash_actual:
+            raise ValueError(f"A different wallet already exists at {wallet_name}.")
         console.print(
-            f"[yellow]Wallet '{wallet_name}' already exists. "
+            f"[yellow]Wallet '{_display_text(wallet_name)}' already exists. "
             f"Restoring config from checkpoint.[/yellow]"
         )
     else:
@@ -5610,7 +6090,8 @@ def _import_wallet_checkpoint(package: dict[str, JSON], current_user: str,
         user_data["wallets"] = wallets
         save_user_data(current_user, user_data, user_password)
 
-    console.print(f"\n[bold green]Wallet '{wallet_name}' restored from checkpoint![/bold green]")
+    console.print(f"\n[bold green]Wallet '{_display_text(wallet_name)}' restored "
+                  "from checkpoint![/bold green]")
     console.print(f"  Address: [cyan]{script_address_actual}[/cyan]")
     console.print(f"  Threshold: {config.get('threshold', 1)} of {config.get('num_cosigners', 1)}")
     console.print(f"  Staking: {'yes' if staking else 'no'}")
@@ -5646,6 +6127,29 @@ def _import_transaction_package(package: dict[str, JSON], current_user: str,
     tx_cbor_hex = _json_str(tx_obj.get("cbor_hex"))
     tx_id = _json_str(tx_obj.get("tx_id"))
 
+    # The tx_id becomes a directory name under this wallet's sessions/, so it
+    # is held to the exact shape this program's exporter produces — the hash
+    # of the transaction body — and to those bytes themselves. An arbitrary
+    # string here must never reach the filesystem ('/tmp/...' or '../' would
+    # name a directory outside the wallet tree), and an id that does not match
+    # the CBOR it claims to describe means the file is corrupt or tampered.
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", tx_id):
+        raise ValueError(
+            "Transaction package has an invalid tx_id (expected 64 hex "
+            "characters). The file may be corrupt or tampered."
+        )
+    try:
+        derived_tx_id = Transaction.from_cbor(tx_cbor_hex).transaction_body.id.payload.hex()
+    except Exception as e:
+        raise ValueError(
+            f"The transaction inside this package is not readable CBOR: {e}"
+        ) from e
+    if derived_tx_id != tx_id.lower():
+        raise ValueError(
+            "Transaction package tx_id does not match the transaction inside "
+            "it. The file may be corrupt or tampered."
+        )
+
     user_data = load_user_data(current_user, user_password)
     if user_data is None:
         raise EncryptionError("Could not load user data to register the transaction.")
@@ -5655,7 +6159,12 @@ def _import_transaction_package(package: dict[str, JSON], current_user: str,
 
     matching_wallet: dict[str, JSON] | None = None
     for w in multisig_wallets:
-        wallet_dir = secure_path_join(WALLET_DIR, _json_str(w.get("name")))
+        try:
+            wallet_dir = secure_path_join(WALLET_DIR, _json_str(w.get("name")))
+        except ValueError:
+            logging.warning(f"Skipping wallet entry with unsafe name: "
+                            f"{_json_str(w.get('name'))!r}")
+            continue
         hash_path = os.path.join(wallet_dir, "script_hash")
         if os.path.exists(hash_path):
             with open(hash_path) as f:
@@ -5669,8 +6178,22 @@ def _import_transaction_package(package: dict[str, JSON], current_user: str,
                          f" {script_hash_hex[:16]}...."
                          " Import the wallet checkpoint first.")
 
-    wallet_dir = secure_path_join(WALLET_DIR, _json_str(matching_wallet.get("name")))
-    session_id = tx_id[:12]
+    try:
+        wallet_dir = secure_path_join(WALLET_DIR, _json_str(matching_wallet.get("name")))
+    except ValueError as e:
+        raise ValueError(f"Refusing to import: {e}") from e
+    # The package's network claim already matched the session; the wallet it
+    # resolves to must agree too, or a mislabeled package would file a
+    # transaction under a wallet whose funds sit on another chain.
+    wallet_net = load_wallet_network(wallet_dir)
+    if wallet_net and wallet_net != network:
+        raise ValueError(
+            f"This package says its transaction is for {network}, but the "
+            f"matched wallet '{_json_str(matching_wallet.get('name'))}' "
+            f"belongs to {wallet_net}. The file is mislabeled or does not "
+            "belong to that wallet."
+        )
+    session_id = tx_id[:12].lower()
     session_dir = os.path.join(wallet_dir, "sessions", session_id)
     os.makedirs(session_dir, exist_ok=True)
 
@@ -5703,9 +6226,9 @@ def _import_transaction_package(package: dict[str, JSON], current_user: str,
     _dump_json(summary, os.path.join(session_dir, "summary.json"))
 
     console.print("\n[bold green]Transaction imported into session![/bold green]")
-    console.print(f"  Wallet: {_json_str(matching_wallet.get('name'))}")
+    console.print(f"  Wallet: {_display_text(_json_str(matching_wallet.get('name')))}")
     console.print(f"  Session: {session_id}")
-    console.print(f"  Stage: {tx_stage}")
+    console.print(f"  Stage: {_display_text(tx_stage)}")
     console.print(f"  Signatures: {len(_json_list(tx_obj.get('signatures_collected')))}"
         f" of {_json_int(tx_obj.get('threshold'))}")
     console.print("\n[bold]Next steps:[/bold]")
@@ -5805,9 +6328,9 @@ def import_partial_signature(wallet_dir: str, session_dir: str,
     _write_session_status(session_dir, collected, threshold)
 
     for name in added:
-        console.print(f"  [green]✓ Added signature from {name}[/green]")
+        console.print(f"  [green]✓ Added signature from {_display_text(name)}[/green]")
     for reason in rejected:
-        console.print(f"  [red]✗ Rejected: {reason}[/red]")
+        console.print(f"  [red]✗ Rejected: {_display_text(reason)}[/red]")
     if not added:
         raise ValueError("No usable signature in that input.")
 
@@ -5927,7 +6450,9 @@ def assemble_multisig_transaction(wallet_dir: str,
 
         for vk_w in _witness_vkeys(partial_witness):
             kh = key_hash_from_vkey(vk_w.vkey.payload)
-            name = cosigner_names.get(kh)
+            # Labels travel inside checkpoint packages, so they display as
+            # text at every sink in this loop, never as markup.
+            name = _display_text(cosigner_names.get(kh, kh.hex()[:16]))
 
             # Two independent checks, both required. Membership answers "is this
             # key allowed to sign this wallet"; verification answers "did this
@@ -5960,7 +6485,7 @@ def assemble_multisig_transaction(wallet_dir: str,
     console.print(f"  [bold]Valid signatures:[/bold] {len(signed_key_hashes)}")
 
     if len(signed_key_hashes) < threshold:
-        missing = [cosigner_names.get(kh, kh.hex()[:16])
+        missing = [_display_text(cosigner_names.get(kh, kh.hex()[:16]))
                    for kh in script_key_hashes if kh not in signed_key_hashes]
         console.print(
             f"[red]Not enough signatures yet ({len(signed_key_hashes)} of {threshold}).[/red]"
@@ -5999,7 +6524,9 @@ def assemble_multisig_transaction(wallet_dir: str,
     console.print(f"  [bold]Fee:[/bold] {format_ada(tx_body.fee)} ADA")
     console.print("  [bold]Signed by:[/bold]")
     for kh in signed_key_hashes:
-        console.print(f"    [green]✓ {cosigner_names.get(kh, kh.hex()[:16])}[/green]")
+        console.print(f"    [green]✓ "
+                      f"{_display_text(cosigner_names.get(kh, kh.hex()[:16]))}"
+                      "[/green]")
     console.print(f"\n  [bold]Final CBOR:[/bold] [cyan]{session_dir}/final.cbor[/cyan]")
 
     submitted_tx_id: str | None = None
@@ -6011,11 +6538,12 @@ def assemble_multisig_transaction(wallet_dir: str,
         try:
             submitted_tx_id = context.submit_tx(final_cbor_hex)
             console.print("[bold green]✓ TRANSACTION SUBMITTED[/bold green]")
-            console.print(f"  TX ID: {submitted_tx_id}")
+            console.print(f"  TX ID: {_display_text(str(submitted_tx_id))}")
             _write_session_status(session_dir, signed_key_hashes, threshold,
                                   status="submitted", tx_id=submitted_tx_id)
         except Exception as e:
-            console.print(f"[red]Submission rejected by the network: {e}[/red]")
+            console.print(f"[red]Submission rejected by the network: "
+                              f"{_display_text(str(e))}[/red]")
             console.print("[yellow]The signed CBOR is saved — you can retry submission "
                           "or submit it with cardano-cli.[/yellow]")
             _write_session_status(session_dir, signed_key_hashes, threshold,
@@ -6061,7 +6589,7 @@ def scan_multisig_addresses(wallet_dir: str) -> dict[str, JSON]:
     # A wrong-network query returns an empty UTxO set and would write that
     # empty result into known_indices as if the wallet were empty. Refuse.
     if _refuse_wrong_network(os.path.basename(wallet_dir), wallet_dir,
-                             "this wallet's balance"):
+                             "Checking this wallet's balance"):
         raise ValueError(
             f"This wallet belongs to {_wallet_network_mismatch(wallet_dir)}; "
             f"switch networks to read its balance.")
@@ -6112,8 +6640,12 @@ def scan_multisig_addresses(wallet_dir: str) -> dict[str, JSON]:
                       "network.[/dim]")
     if total_assets:
         console.print("  [bold]Native tokens:[/bold]")
-        for (_policy_id, asset_name), amount in sorted(total_assets.items()):
-            console.print(f"    {asset_name or '(no name)'}: {amount}")
+        # The policy id prints beside every name: names are policy-scoped, so
+        # two tokens can share a display name, and only the policy tells a
+        # spoofed holding from the genuine one.
+        for (policy_id, asset_name), amount in sorted(total_assets.items()):
+            console.print(f"    {_display_text(asset_name or '(no name)')}: {amount}"
+                          f"  [dim]{policy_id[:16]}…[/dim]")
 
     result: dict[str, JSON] = {
         "address": address,
@@ -6160,14 +6692,18 @@ def _cosigner_description(wallet: MultisigWalletInfo, index: int) -> str:
     """
     label = wallet["labels"].get(wallet["key_hashes"][index], "")
     position = f"cosigner {index + 1}"
-    return position if label in ("", position) else f"{position} ({label})"
+    if label in ("", position):
+        return position
+    # Labels can arrive inside a checkpoint package, so they display as text,
+    # never as markup.
+    return f"{position} ({_display_text(label)})"
 
 
 def _print_multisig_summary(wallet_name: str, wallet: MultisigWalletInfo,
                             ours: set[int]) -> None:
     """The header every multisig view starts with: what this wallet is."""
     console.print(f"\n[bold underline bright_cyan]Multisig Wallet: "
-                  f"{wallet_name}[/bold underline bright_cyan]")
+                  f"{_display_text(wallet_name)}[/bold underline bright_cyan]")
     console.print(f"  Address:   [cyan]{wallet['script_address']}[/cyan]")
     flat = script_is_flat_threshold(wallet["script"])
     console.print(f"  Threshold: {'' if flat else 'at least '}{wallet['threshold']} "
@@ -6225,7 +6761,7 @@ def _edit_cosigner_labels(wallet_dir: str, wallet: MultisigWalletInfo) -> None:
     """
     while True:
         options = [
-            f"{i + 1}. {wallet['labels'].get(key_hash, '')}  "
+            f"{i + 1}. {_display_text(wallet['labels'].get(key_hash, ''))}  "
             f"[dim]{key_hash.hex()[:16]}…[/dim]"
             for i, key_hash in enumerate(wallet["key_hashes"])
         ]
@@ -6252,7 +6788,7 @@ def _edit_cosigner_labels(wallet_dir: str, wallet: MultisigWalletInfo) -> None:
         _dump_json(config, os.path.join(wallet_dir, "config.json"))
         wallet["labels"] = _multisig_labels(config, wallet["key_hashes"])
         console.print(f"[green]Cosigner {choice + 1} is now "
-                      f"'{wallet['labels'][key_hash]}'.[/green]")
+                      f"'{_display_text(wallet['labels'][key_hash])}'.[/green]")
 
         console.print("[bold]Name another cosigner? (y/n)[/bold]")
         if not _prompt_yes_no(default=False):
@@ -6298,7 +6834,8 @@ def multisig_view_wallet(current_user: str, user_password: str) -> None:
             script_path = os.path.join(wallet_dir, "script.json")
             if os.path.exists(script_path):
                 with open(script_path) as f:
-                    console.print(_dumps_json(_json_loads(f.read())))
+                    console.print(_dumps_json(_json_loads(f.read())),
+                                  markup=False)
             else:
                 console.print("[red]Script not found.[/red]")
         elif choice == "5":
@@ -6325,11 +6862,17 @@ def show_mnemonic(current_user: str, user_password: str) -> None:
         if user_data is None:
             return
         wallets = _json_list(user_data.get("wallets"))
-        if not wallets:
-            console.print("[yellow]You have no wallets yet.[/yellow]")
+        # A mnemonic is a personal-wallet artifact; multisig wallets hold a
+        # script and no mnemonic, so they never appear in this door.
+        personal = [w for w in wallets
+                    if not _json_str(_json_object(w).get("type", "")).startswith(
+                        "multisig")]
+        if not personal:
+            console.print("[yellow]You have no personal wallets (multisig wallets "
+                          "have no mnemonic).[/yellow]")
             return
         console.print("[bold green]Your wallets:[/bold green]")
-        for i, w in enumerate(wallets, 1):
+        for i, w in enumerate(personal, 1):
             console.print(f"{i}. {_wallet_entry_name(w)}")
         console.print("[bold]Enter the number of the wallet to show its mnemonic, or type 'cancel'"
             "to go back:[/bold]")
@@ -6337,24 +6880,47 @@ def show_mnemonic(current_user: str, user_password: str) -> None:
             choice = session.prompt("> ").strip()
             if choice.lower() == "cancel":
                 return
-            if not choice.isdigit() or not (1 <= int(choice) <= len(wallets)):
+            if not choice.isdigit() or not (1 <= int(choice) <= len(personal)):
                 console.print("[red]Invalid choice, try again or type 'cancel'.[/red]")
                 continue
-            wallet_entry = wallets[int(choice) - 1]
+            wallet_entry = personal[int(choice) - 1]
             wallet_name = _wallet_entry_name(wallet_entry)
             break
         wallet_dir = secure_path_join(WALLET_DIR, wallet_name)
         mnemonic_path = os.path.join(wallet_dir, "mnemonic.enc")
         if not os.path.exists(mnemonic_path):
+            if os.path.exists(os.path.join(wallet_dir, "payment.skey")):
+                # Keys exist without a mnemonic: the normal state of a wallet
+                # imported from key files. A fresh mnemonic would be a NEW
+                # identity, and saving it would replace the very keys that can
+                # spend this wallet's funds — so that is refused outright
+                # rather than offered as a recovery aid.
+                console.print("[red]This wallet has signing keys but no stored "
+                              "mnemonic.[/red]")
+                console.print("A wallet imported from key files never stores one: "
+                              "its spending key arrived directly, and there is no "
+                              "mnemonic behind it to show.")
+                console.print("Generating a fresh mnemonic would NOT recover this "
+                              "wallet — it would be a brand-new identity whose "
+                              "saving would overwrite the keys that can spend "
+                              "these funds. This program will not do that.")
+                console.print("To start a fresh wallet, use Create Wallet under a "
+                              "new name instead.")
+                return
             console.print("[red]Mnemonic not found for this wallet.[/red]")
-            console.print("[bold]Do you want to generate and save a new mnemonic for this wallet?"
+            console.print("[bold]This wallet directory has no keys and no mnemonic. "
+                "Generate a brand-new wallet here, with a new 24-word mnemonic? "
                 "(yes/no)[/bold]")
             while True:
                 answer = session.prompt("> ").strip().lower()
                 if answer in ("yes", "y"):
-                    console.print("[bold]Enter your password to encrypt the wallet's keys and "
-                        "mnemonic:[/bold]")
-                    password = prompt_existing_password()
+                    password = _prompt_new_password(
+                        "Enter your password to encrypt the new wallet's keys and "
+                        "mnemonic")
+                    if password is None:
+                        console.print("[yellow]Cancelled; nothing was "
+                                      "generated.[/yellow]")
+                        return
                     try:
                         mnemonic_phrase = generate_mnemonic()
                         logging.debug(f"[DEBUG-show_mnemonic] Generated new mnemonic for wallet"
@@ -6418,7 +6984,7 @@ def funds_send() -> None:
                 console.print("[red]Wallet not found. Please create or import the wallet"
                               " first or type 'cancel' to abort.[/red]")
                 continue
-            if _refuse_wrong_network(wallet_name, wallet_dir, "a send"):
+            if _refuse_wrong_network(wallet_name, wallet_dir, "Sending a transaction"):
                 continue
             break
 
@@ -6469,7 +7035,7 @@ def funds_send() -> None:
         send_ada(wallet_dir, recipient, amount_lovelace, password,
                  assets=assets, sweep=sweep)
     except Exception as e:
-        console.print(f"[red]Failed to send funds: {e}[/red]")
+        console.print(f"[red]Failed to send funds: {_display_text(str(e))}[/red]")
     logging.debug("[EXIT] funds_send()")
 
 @exception_error
@@ -6507,6 +7073,9 @@ def send_ada(wallet_dir: str, recipient: str, amount_lovelace: int, password: st
         except Exception as addr_err:
             logging.error(f"Invalid recipient address: {recipient}", exc_info=True)
             raise ValueError(f"Invalid recipient address: {recipient}") from addr_err
+        # The sending wallet was network-guarded at the door; the destination
+        # gets the same refusal, before anything is built or confirmed.
+        _refuse_foreign_network_address(recipient_address)
 
         # A sweep leaves nothing behind: the one output carries every asset
         # plus the minimum ADA such an output needs, and the change address is
@@ -6591,6 +7160,25 @@ def send_ada(wallet_dir: str, recipient: str, amount_lovelace: int, password: st
                     ) from e
 
         try:
+            # The fee is server-derived math (protocol parameters over wire
+            # size), so it is shown before submission — the operator sees what
+            # the spend costs and can refuse it, exactly as the multisig
+            # builder's review already does.
+            fee_lovelace = signed_tx.transaction_body.fee
+            console.print(f"\n  Transaction fee: [bold]{format_ada(fee_lovelace)}"
+                          " ADA[/bold]")
+            if sweep:
+                console.print("  (EVERYTHING send: the fee is the only cost — the "
+                              "rest of the balance goes to the recipient.)")
+            else:
+                console.print(f"  Total leaving the wallet: "
+                              f"{format_ada(amount_lovelace + fee_lovelace)} ADA "
+                              "(amount + fee; change comes back).")
+            console.print("[bold]Submit it now? (y/n):[/bold]")
+            if session.prompt("> ").strip().lower() != "y":
+                console.print("[yellow]Not submitted. Nothing was "
+                              "sent.[/yellow]")
+                return None
             # Submit the transaction
             cbor_hex = signed_tx.to_cbor().hex()
             tx_id = context.submit_tx(cbor_hex)
@@ -6598,7 +7186,8 @@ def send_ada(wallet_dir: str, recipient: str, amount_lovelace: int, password: st
                 console.print("[red]Submission failed: the backend returned no "
                               "transaction id.[/red]")
                 return None
-            console.print(f"[green]Transaction submitted successfully! TX ID: {tx_id}[/green]")
+            console.print(f"[green]Transaction submitted successfully! TX ID: "
+                      f"{_display_text(tx_id)}[/green]")
             # Submission is not visibility. The UTXO query reads the ledger,
             # not the mempool, so a second send started right now would be
             # built on inputs this transaction already spent and rejected with
@@ -6625,7 +7214,8 @@ def send_ada(wallet_dir: str, recipient: str, amount_lovelace: int, password: st
             return None
         except TransactionSubmissionError as e:
             logging.error(f"Exception in send_ada: {e}", exc_info=True)
-            console.print(f"[red]Failed to send Cardano Native Token ADA or token: {e}[/red]")
+            console.print(f"[red]Failed to send Cardano Native Token ADA or token: "
+                        f"{_display_text(str(e))}[/red]")
             console.print("[yellow]A rejection saying the inputs are already spent "
                           "can mean the wallet's balance view was stale. Check the "
                           "balance before retrying; re-sending the same amount is "
@@ -6633,7 +7223,8 @@ def send_ada(wallet_dir: str, recipient: str, amount_lovelace: int, password: st
             return None
         except Exception as e:
             logging.error(f"Exception in send_ada: {e}", exc_info=True)
-            console.print(f"[red]Failed to send Cardano Native Token ADA or token: {e}[/red]")
+            console.print(f"[red]Failed to send Cardano Native Token ADA or token: "
+                        f"{_display_text(str(e))}[/red]")
             raise
 
     except ValueError as ve:
@@ -6642,7 +7233,8 @@ def send_ada(wallet_dir: str, recipient: str, amount_lovelace: int, password: st
         return None
     except Exception as e:
         logging.error(f"Exception in send_ada: {e}", exc_info=True)
-        console.print(f"[red]Failed to send Cardano Native Token ADA or token: {e}[/red]")
+        console.print(f"[red]Failed to send Cardano Native Token ADA or token: "
+                        f"{_display_text(str(e))}[/red]")
         raise
 
 @exception_error
@@ -6688,33 +7280,62 @@ def delete_wallet(current_user: str, user_password: str) -> None:
 
     try:
         wallet_dir = secure_path_join(WALLET_DIR, wallet_name)
+        # One wallet directory can be referenced by more than one account:
+        # checkpoint import deliberately reuses an existing same-script
+        # directory. Say so before the tree is destroyed.
+        if os.path.exists(os.path.join(wallet_dir, "script.cbor")):
+            console.print("[yellow]This is a multisig wallet directory. If another "
+                          "account on this machine imported the same checkpoint, "
+                          "they reference this directory too — deleting it removes "
+                          "the wallet for everyone.[/yellow]")
+            console.print("[bold]Delete it anyway? (y/n)[/bold]")
+            if session.prompt("> ").strip().lower() != "y":
+                console.print("[yellow]Deletion cancelled.[/yellow]")
+                return
         shutil.rmtree(wallet_dir)
         wallets.remove(wallets[int(choice) - 1])
         user_data["wallets"] = wallets
         save_user_data(current_user, user_data, user_password)
         console.print(f"[green]Wallet '{wallet_name}' deleted successfully![/green]")
+    except ValueError as e:
+        console.print(f"[red]Refusing to delete: {e}[/red]")
     except Exception as e:
         console.print(f"[red]Failed to delete wallet: {e}[/red]")
     logging.debug(f"[EXIT] delete_wallet(user={current_user})")
 
 @exception_error
-def delete_user() -> None:
-    logging.debug("[ENTRY] delete_user()")
+def delete_user(current_user: str) -> None:
+    """Delete the logged-in account and the wallets only it is sure to own.
+
+    The door is bound to the session: an account is deleted by its own logged
+    -in owner, not by name-plus-password alone. Wallet names are re-validated
+    at the destructive sink (a name is one directory component, never a
+    path), and a multisig directory — which another account may reference
+    through checkpoint import — is only removed after an explicit extra
+    confirmation.
+    """
+    logging.debug(f"[ENTRY] delete_user(user={current_user})")
     flash_banner("!!! WARNING: DELETE USER ACCOUNT !!!")
 
     console.print("[bold red]This will permanently delete your user account and ALL associated "
         "wallets.[/bold red]")
     console.print("[bold red]This action CANNOT be undone.[/bold red]")
-    console.print("[bold]Type your username to confirm deletion or 'cancel' to abort:[/bold]")
+    console.print(f"[bold]Type '{current_user}' to confirm deletion, or 'cancel' to "
+        "abort:[/bold]")
     while True:
         username = session.prompt("> ").strip()
         if username.lower() == "cancel":
             console.print("[yellow]Delete user cancelled.[/yellow]")
             return
-        user_file = os.path.join(USER_DATA_DIR, f"{username}.userdb")
-        if not os.path.exists(user_file):
-            console.print("[red]User not found. Please try again or type 'cancel'.[/red]")
+        if username != current_user:
+            console.print("[red]This door deletes the account you are logged in "
+                          f"as ({current_user}). Type it exactly, or "
+                          "'cancel'.[/red]")
             continue
+        user_file = _user_db_path(username)
+        if not os.path.exists(user_file):
+            console.print("[red]User data file not found. Aborting.[/red]")
+            return
         break
 
     console.print("[bold red]You must confirm your password twice to proceed.[/bold red]")
@@ -6723,9 +7344,10 @@ def delete_user() -> None:
         pw = session.prompt(
             HTML(f"<ansired>Enter your password ({attempt+1}/2): </ansired>"),
             is_password=True)
-        try:
-            _ = load_user_data(username, pw)
-        except Exception:
+        # load_user_data is wrapped by @exception_error: it reports failure by
+        # returning None and never raises, so the password is verified by the
+        # return value — an except branch here would be unreachable dead code.
+        if load_user_data(username, pw) is None:
             console.print("[red]Password incorrect. Aborting deletion.[/red]")
             return
         if attempt == 0:
@@ -6739,10 +7361,25 @@ def delete_user() -> None:
         user_data = load_user_data(username, pw)
         if user_data is not None:
             for wallet_entry in _json_list(user_data.get("wallets")):
-                wallet_dir = secure_path_join(WALLET_DIR, _wallet_entry_name(wallet_entry))
-                if os.path.exists(wallet_dir):
-                    shutil.rmtree(wallet_dir)
-        os.remove(os.path.join(USER_DATA_DIR, f"{username}.userdb"))
+                name = _wallet_entry_name(wallet_entry)
+                try:
+                    wallet_dir = secure_path_join(WALLET_DIR, name)
+                except ValueError as e:
+                    console.print(f"[red]Refusing to delete wallet {name!r}: {e}[/red]")
+                    continue
+                if not os.path.exists(wallet_dir):
+                    continue
+                if os.path.exists(os.path.join(wallet_dir, "script.cbor")):
+                    console.print(f"[yellow]'{name}' is a multisig wallet. Another "
+                                  "account on this machine may reference the same "
+                                  "directory through checkpoint import — deleting "
+                                  "it removes the wallet for them too.[/yellow]")
+                    console.print(f"[bold]Delete '{name}' anyway? (y/n)[/bold]")
+                    if session.prompt("> ").strip().lower() != "y":
+                        console.print(f"[yellow]Kept '{name}'.[/yellow]")
+                        continue
+                shutil.rmtree(wallet_dir)
+        os.remove(_user_db_path(username))
         console.print(f"[green]User '{username}' and all their wallets deleted "
             "successfully.[/green]")
     except Exception as e:
@@ -6881,7 +7518,7 @@ def tracker_lp(current_user: str, user_password: str) -> None:
         wallet_name = _wallet_entry_name(wallet_entry)
         if _refuse_wrong_network(wallet_name,
                                  secure_path_join(WALLET_DIR, wallet_name),
-                                 "this wallet's assets"):
+                                 "Viewing this wallet's assets"):
             continue
         break
     address = _json_str(_json_object(wallet_entry).get("address"))
@@ -6915,7 +7552,7 @@ def tracker_lp(current_user: str, user_password: str) -> None:
         table.add_column("Amount", justify="right")
         table.add_row("ADA", "", format_ada(total_lovelace))
         for (policy_id, asset_name), amount in sorted(assets.items()):
-            table.add_row(asset_name, policy_id, str(amount))
+            table.add_row(_display_text(asset_name), policy_id, str(amount))
         console.print(table)
         logging.debug(f"[EXIT] tracker_lp(user={current_user})")
     except Exception as e:
@@ -6930,8 +7567,18 @@ def _read_cbor_hex(source: str) -> str:
     treated as pasted hex.
     """
     if os.path.isfile(source):
+        # A received-from-others file is untrusted input; reading it whole
+        # (and then hexing it) would multiply its size in memory before the
+        # parser ever got to reject it. No legitimate script or transaction
+        # file reaches a tenth of this bound.
         with open(source, "rb") as f:
-            raw = f.read().strip()
+            head = f.read(MAX_CBOR_FILE_BYTES)
+            if f.read(1):
+                raise ValueError(
+                    "That file is larger than any Cardano script or "
+                    "transaction can be — refusing to load it."
+                )
+        raw = head.strip()
         try:
             text = raw.decode("ascii").strip()
             if len(text) >= 2 and all(c in "0123456789abcdefABCDEF" for c in text):
@@ -6980,7 +7627,9 @@ def _prompt_file_path(title: str, exts: tuple[str, ...] = (".cbor", ".json"),
                             complete_while_typing=True).strip()
     if not choice or choice.lower() == "cancel":
         return None
-    if choice.isdigit() and 1 <= int(choice) <= len(candidates):
+    # ASCII digits only: str.isdigit() accepts superscripts and other
+    # Unicode digits, which then explode in int() or silently select a file.
+    if choice.isascii() and choice.isdigit() and 1 <= int(choice) <= len(candidates):
         return candidates[int(choice) - 1]
     return os.path.expanduser(choice)
 
@@ -7069,7 +7718,8 @@ def _prompt_send_selection(address: str
             # The brackets are literal, not Rich markup — an unescaped "[x]"
             # is silently swallowed as an unknown style tag.
             mark = "\\[x]" if i in marked else "\\[ ]"
-            console.print(f"  {mark} {i}. {_asset_display_name(name)} × {quantity}  "
+            console.print(f"  {mark} {i}. "
+                          f"{_display_text(_asset_display_name(name))} × {quantity}  "
                           f"[dim]{policy.hex()[:12]}…[/dim]")
         answer = session.prompt("> ").strip().lower()
         if answer == "cancel":
@@ -7099,7 +7749,7 @@ def _prompt_send_selection(address: str
     chosen: list[tuple[bytes, bytes, int]] = []
     for i in sorted(marked):
         (policy, name), available = entries[i - 1]
-        display = _asset_display_name(name)
+        display = _display_text(_asset_display_name(name))
         while True:
             console.print(f"How many {display} should be sent? "
                           f"(max {available}; Enter sends all; 'cancel' aborts)")
@@ -7253,7 +7903,11 @@ def _select_multisig_wallet(current_user: str, user_password: str,
         name = _json_str(_json_object(w).get("name"))
         if not name:
             continue
-        wallet_dir = secure_path_join(WALLET_DIR, name)
+        try:
+            wallet_dir = secure_path_join(WALLET_DIR, name)
+        except ValueError:
+            logging.warning(f"Skipping wallet entry with unsafe name: {name!r}")
+            continue
         # The script file is what makes a wallet a multisig wallet — more
         # reliable than the type tag, which older wallets spell differently.
         if os.path.exists(os.path.join(wallet_dir, "script.cbor")):
@@ -7270,7 +7924,7 @@ def _select_multisig_wallet(current_user: str, user_password: str,
         wallet_dir = secure_path_join(WALLET_DIR, name)
         try:
             info = _load_multisig_wallet(wallet_dir)
-            label = f"{name}  [dim]({info['threshold']} of " \
+            label = f"{_display_text(name)}  [dim]({info['threshold']} of " \
                     f"{len(info['key_hashes'])} must sign)[/dim]"
         except Exception:
             label = name
@@ -7286,7 +7940,7 @@ def _select_multisig_wallet(current_user: str, user_password: str,
         if choice is None:
             return None
         wallet_dir = secure_path_join(WALLET_DIR, names[choice])
-        if not _refuse_wrong_network(names[choice], wallet_dir, "this wallet"):
+        if not _refuse_wrong_network(names[choice], wallet_dir, "Opening this wallet"):
             return wallet_dir
 
 
@@ -7355,7 +8009,11 @@ def _find_wallet_by_script_hash(current_user: str, user_password: str,
         name = _json_str(_json_object(w).get("name"))
         if not name:
             continue
-        wallet_dir = secure_path_join(WALLET_DIR, name)
+        try:
+            wallet_dir = secure_path_join(WALLET_DIR, name)
+        except ValueError:
+            logging.warning(f"Skipping wallet entry with unsafe name: {name!r}")
+            continue
         hash_path = os.path.join(wallet_dir, "script_hash")
         if not os.path.exists(hash_path):
             continue
@@ -7393,8 +8051,32 @@ def _wallet_for_incoming_transaction(current_user: str, user_password: str,
     script = scripts[0]
     script_hash_hex = script_hash_from_script(script).hex()
 
+    # The transaction's own outputs say which network family it belongs to. A
+    # body from another network cannot spend anything on this session's chain,
+    # and recovering a wallet for it here would stamp this session's network
+    # into a wallet whose funds sit on another chain — so refuse instead.
+    outputs = tx.transaction_body.outputs
+    if outputs:
+        tx_network = outputs[0].address.network
+        if tx_network != current_network():
+            tx_net_name = ("mainnet" if tx_network == Network.MAINNET
+                           else "testnet (preprod or preview)")
+            console.print(f"[red]This transaction pays out to {tx_net_name} "
+                          f"addresses, but you are connected to "
+                          f"{SELECTED_NETWORK or 'preprod'}. It cannot spend "
+                          "anything here — switch networks first (Switch "
+                          "Backend) if this file is really meant for "
+                          "you.[/red]")
+            return None
+
     known = _find_wallet_by_script_hash(current_user, user_password, script_hash_hex)
     if known:
+        # Every wallet-facing door refuses a wrong-network wallet; signing an
+        # imported body is no exception, or the relay path would be the one
+        # door that quietly signs through the wrong backend.
+        if _refuse_wrong_network(os.path.basename(known), known,
+                                 "Signing this transaction"):
+            return None
         return known
 
     console.print("\n[yellow]This transaction is for a multisig wallet you do not "
@@ -7534,9 +8216,11 @@ def _interactive_sign_multisig(current_user: str, user_password: str) -> None:
                 return
             try:
                 txid = context.submit_tx(_json_str(sign_result["partial_cbor_hex"]))
-                console.print(f"[bold green]✓ SUBMITTED — TX ID: {txid}[/bold green]")
+                console.print(f"[bold green]✓ SUBMITTED — TX ID: {_display_text(str(txid))}"
+                              "[/bold green]")
             except Exception as e:
-                console.print(f"[red]Submission rejected by the network: {e}[/red]")
+                console.print(f"[red]Submission rejected by the network: "
+                              f"{_display_text(str(e))}[/red]")
                 console.print("[yellow]The signed CBOR is saved — submit it via"
                               " Assemble & Submit or cardano-cli.[/yellow]")
                 console.print("[dim]A rejection is occasionally reported for a"
@@ -7771,6 +8455,11 @@ def _preview_script_before_import(current_user: str, user_password: str,
     matches = _match_cosigner_identities(current_user, user_password, key_hashes)
     if matches:
         console.print("\n[bold green]You can sign for this wallet.[/bold green]")
+        # The match above may come from a wallet's cached key hashes; signing
+        # itself always re-derives under the password, so this is a hint, not
+        # a claim this program stakes anything on.
+        console.print("  [dim](matched by key hash; signing re-verifies your "
+                      "key under the wallet's password)[/dim]")
         for match in matches:
             console.print(f"  cosigner {match['script_index'] + 1} — your "
                           f"'{match['wallet_name']}' wallet")
@@ -7974,9 +8663,25 @@ def _interactive_export_transaction_package(current_user: str, user_password: st
         return
 
     console.print("[bold bright_cyan]Export Transaction Package[/bold bright_cyan]")
-    console.print("Select a multisig wallet:")
+    # The wrong-network tag every wallet selector shows: exporting a package
+    # is offline, but the package's network claim gates every cosigner who
+    # receives it, so the door refuses the same wallet state every other
+    # wallet-facing door refuses.
+    shown = 0
     for i, w in enumerate(multisig_wallets, 1):
-        console.print(f"  {i}. {w['name']}")
+        name = _json_str(w.get("name"))
+        try:
+            wallet_dir_probe = secure_path_join(WALLET_DIR, name)
+        except ValueError:
+            continue
+        mismatch = _wallet_network_mismatch(wallet_dir_probe)
+        tag = f"  [red]\\[{mismatch} — you are on {SELECTED_NETWORK}][/red]" \
+            if mismatch else ""
+        console.print(f"  {i}. {_display_text(name)}{tag}")
+        shown += 1
+    if shown == 0:
+        console.print("[yellow]No usable multisig wallets found.[/yellow]")
+        return
 
     console.print("[bold]Enter wallet number or 'cancel':[/bold]")
     choice = session.prompt("> ").strip()
@@ -7990,7 +8695,14 @@ def _interactive_export_transaction_package(current_user: str, user_password: st
         console.print("[red]Invalid choice.[/red]")
         return
 
-    wallet_dir = secure_path_join(WALLET_DIR, wallet_name)
+    try:
+        wallet_dir = secure_path_join(WALLET_DIR, wallet_name)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        return
+    if _refuse_wrong_network(wallet_name, wallet_dir,
+                             "Exporting this wallet's package"):
+        return
     sessions_dir = os.path.join(wallet_dir, "sessions")
 
     if not os.path.exists(sessions_dir):
@@ -8138,13 +8850,13 @@ def show_my_cosigner_key(current_user: str, user_password: str) -> None:
         return
     wallet_name, wallet_dir = wallets[choice]
 
-    candidates = _read_cosigner_key_hash_cache(wallet_dir)
-    if not candidates:
-        verified = _prompt_wallet_password(wallet_name, wallet_dir,
-                                           _wallet_cosigner_key_hashes)
-        if verified is None:
-            return
-        candidates = verified[1]
+    # Publication door: what this screen prints gets typed into someone's
+    # script forever, so the hashes are proven under the wallet's password
+    # rather than read from the editable cache.
+    candidates = _verified_cosigner_key_hashes(wallet_name, wallet_dir)
+    if candidates is None:
+        console.print("[yellow]Cancelled.[/yellow]")
+        return
 
     console.print(f"\n[bold green]Cosigner key hashes for '{wallet_name}':[/bold green]")
     for label, kh in candidates.items():
@@ -8237,7 +8949,7 @@ def main_menu(current_user: str, user_password: str) -> None:
         "Show Mnemonic Passphrase": lambda: show_mnemonic(current_user, user_password),
         "Send Funds": funds_send,
         "Delete Wallet": lambda: delete_wallet(current_user, user_password),
-        "Delete User": delete_user,
+        "Delete User": lambda: delete_user(current_user),
         "Pool Registration": pool_registration,
         "DRep Registration": drep_registration,
         "Switch Backend": switch_backend,
@@ -8272,7 +8984,10 @@ def prompt_blockfrost_setup() -> None:
     base_url = BLOCKFROST_URLS.get(SELECTED_NETWORK or "preprod", BLOCKFROST_URLS["preprod"])
     while True:
         console.print(f"[yellow]Enter your Blockfrost {SELECTED_NETWORK} API key:[/yellow]")
-        BLOCKFROST_PROJECT_ID = session.prompt("> ").strip()
+        # Masked like every password prompt: the project id is a bearer
+        # credential, and the echoed line survives in scrollback and screen
+        # shares.
+        BLOCKFROST_PROJECT_ID = session.prompt("> ", is_password=True).strip()
         if not BLOCKFROST_PROJECT_ID:
             console.print("[red]API key cannot be empty.[/red]")
             continue
@@ -8285,7 +9000,7 @@ def prompt_blockfrost_setup() -> None:
                 continue
             resp.raise_for_status()
         except _REQUEST_ERROR as e:
-            console.print(f"[red]Failed to validate API key: {e}[/red]")
+            console.print(f"[red]Failed to validate API key: {_display_text(str(e))}[/red]")
             continue
         break
 
@@ -8304,10 +9019,10 @@ def prompt_koios_setup() -> None:
         health = koios.health()
         if not health.get("is_healthy"):
             err = _json_str(health.get("error"), "unknown error")
-            console.print(f"[red]Koios responded but is not healthy: {err}[/red]")
+            console.print(f"[red]Koios responded but is not healthy: {_display_text(err)}[/red]")
             return
     except Exception as e:
-        console.print(f"[red]Cannot connect to Koios at {base_url}: {e}[/red]")
+        console.print(f"[red]Cannot connect to Koios at {base_url}: {_display_text(str(e))}[/red]")
         return
     BACKEND_TYPE = "koios"
     context = koios
@@ -8325,6 +9040,14 @@ def _normalize_local_endpoint(raw: str) -> str:
     trimmed = raw.strip().strip('"').strip("'")
     if "://" not in trimmed:
         trimmed = f"http://{trimmed}"
+    # A pasted ftp:// or file:// value would die later as a library
+    # InvalidSchema deep inside a backend call, reading as "endpoint
+    # unreachable"; naming the mistake here says what to fix.
+    if not trimmed.lower().startswith(("http://", "https://")):
+        raise ValueError(
+            f"A local endpoint is http(s) — {trimmed.split('://')[0]}:// is "
+            "not. Give the Ogmios/Kupo URL as http://host:port."
+        )
     return trimmed.rstrip("/")
 
 def prompt_local_stack_setup() -> None:
@@ -8345,10 +9068,12 @@ def prompt_local_stack_setup() -> None:
                 console.print(f"[red]Cannot connect to Ogmios at {ogmios_url}. Is your local node"
                     "running?[/red]")
             else:
-                console.print(f"[red]Ogmios responded but is not healthy: {err}[/red]")
+                console.print(f"[red]Ogmios responded but is not healthy: "
+                              f"{_display_text(err)}[/red]")
             return
     except Exception as e:
-        console.print(f"[red]Cannot connect to Ogmios at {ogmios_url}: {e}[/red]")
+        console.print(f"[red]Cannot connect to Ogmios at {ogmios_url}: "
+                f"{_display_text(str(e))}[/red]")
         return
     detected = ogmios._detected_network_name
     if detected and SELECTED_NETWORK and detected != SELECTED_NETWORK:
@@ -8366,7 +9091,8 @@ def prompt_local_stack_setup() -> None:
         kupo.health()
         kupo_ok = True
     except Exception as e:
-        console.print(f"[yellow]Kupo not reachable at {kupo_url} ({e}). Using "
+        console.print(f"[yellow]Kupo not reachable at {kupo_url} "
+            f"({_display_text(str(e))}). Using "
             "Ogmios for UTxO queries (slower).[/yellow]")
     BACKEND_TYPE = "local"
     context = ogmios
@@ -8406,6 +9132,7 @@ def prompt_backend_setup() -> None:
 
 def main() -> None:
     logging.debug("[ENTRY] main()")
+    _harden_data_tree()
     console.print("[bold yellow]Starting CardanoInterface...[/bold yellow]")
 
     while True:

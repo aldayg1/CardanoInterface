@@ -6,8 +6,9 @@ every draft (test-suite skill: the agent owns correctness, the model only
 types).
 
 Phase 2 (--complete): after the agent has read the drafts and recorded
-approved.json (a JSON list of approved symbol names, possibly after hand
-edits), this runs write → verify → record → report.
+approved.json (via --approve, which binds each approved symbol to the sha256
+of the draft bytes actually read), this runs write → verify → record →
+report.
 
 vLLM downtime: at startup the endpoint is health-checked; if it is not
 serving, the run ANNOUNCES it and retries on the 3min/5min/10min schedule,
@@ -38,6 +39,7 @@ import argparse
 import json
 import signal
 from datetime import UTC, datetime
+from typing import cast
 
 from langgraph.graph import END, StateGraph
 
@@ -71,13 +73,45 @@ def _module_name(target: Path) -> str:
     return target.stem
 
 
+def _record_approval(repo: str, symbols: list[str]) -> int:
+    """Write approved.json, binding each symbol to its draft's current bytes.
+
+    Approval is an act of the assessing agent over content they have READ:
+    the recorded sha256 is what write_node later demands from the file on
+    disk, so a draft that changes (regeneration, stale session, concurrent
+    run) between approval and write is refused instead of written.
+    """
+    import hashlib
+    review = Path(repo).resolve() / "tests" / "_review"
+    digests: dict[str, str] = {}
+    missing: list[str] = []
+    for symbol in symbols:
+        draft = review / f"draft_{symbol}.py"
+        if not draft.exists():
+            missing.append(symbol)
+            continue
+        digests[symbol] = hashlib.sha256(draft.read_bytes()).hexdigest()
+    if missing:
+        print(f"no reviewed draft file for: {', '.join(missing)}", file=sys.stderr)
+        return 2
+    (review / "approved.json").write_text(
+        json.dumps({"approver": "agent", "digests": digests}, indent=2) + "\n",
+        encoding="utf-8")
+    print(f"approved (content-bound): {', '.join(digests)}")
+    print("run again with --complete (add --notes \"...\" to record "
+          "assessment notes in the knowledge base)")
+    return 0
+
+
 def _refresh(args: argparse.Namespace, dry: bool = False) -> int:
     """Unattended final phase: staleness scan → delete+remake stale symbols
     (machine-validated) → verify → record → final report. The agent's job is
     AFTERWARDS: read last_report.md and validate against the standard."""
     from testbuilder import acquire
     registry = knowledge.get_oracles()
-    changed = acquire.refresh_sources(registry)
+    # A dry run observes and prints; it persists nothing (registry, captures,
+    # staged changes all stay untouched).
+    changed = acquire.refresh_sources(registry, persist=not dry)
     stale = knowledge.stale_symbols()
     stale_map = dict(stale)
     for symbol, change_reason in changed:
@@ -107,6 +141,9 @@ def _refresh(args: argparse.Namespace, dry: bool = False) -> int:
             "plans": [],
             "prior_failure": prior_failure or {},
             "errors": [],
+            # Refresh runs with no assessing principal in the loop: its
+            # writes are machine-approved and recorded as such.
+            "unattended": True,
         }
         # registry supplies the oracle in plan_node (no --oracle needed)
         g = _mk_graph(["inventory", "plan", "draft", "check", "validate",
@@ -134,6 +171,9 @@ def _refresh(args: argparse.Namespace, dry: bool = False) -> int:
         verdict = "REGENERATED + VERIFIED" if (ok and not errors) else "FAILED"
         if ok and not errors:
             generated += 1
+            # The staged source change is consumed only now that the
+            # dependent remake verified against the new reality.
+            acquire.promote_source_hash(symbol)
         else:
             tag_desc = "; ".join(
                 t["description"][:300] for t in result.get("tags", []))
@@ -166,6 +206,7 @@ def _refresh(args: argparse.Namespace, dry: bool = False) -> int:
         if ok and not errors:
             remediated += 1
             generated += 1
+            acquire.promote_source_hash(symbol)
             report_lines += [
                 f"## {symbol} — remediation", "",
                 "- Verdict: RE-MADE CLEANLY on the single fresh attempt",
@@ -262,6 +303,10 @@ def main() -> int:
                     help="phase 2: write approved drafts and verify")
     ap.add_argument("--notes", default="",
                     help="assessment notes recorded to the knowledge base (phase 2)")
+    ap.add_argument("--approve", action="store", nargs="+", metavar="SYM",
+                    help="phase-1.5: record agent approval of the named draft "
+                         "symbol(s) into approved.json, bound to the sha256 of "
+                         "each draft's current bytes (read them first)")
     ap.add_argument("--refresh", action="store_true",
                     help="unattended final phase: remake every stale symbol, "
                          "machine-validate, write, verify, record, report")
@@ -269,7 +314,11 @@ def main() -> int:
                     help="with --refresh: only print the staleness scan")
     args = ap.parse_args()
 
-    if not args.refresh and not args.complete \
+    # argparse's Namespace is untyped; cast each new flag at this one
+    # boundary instead of letting Any spread through the wiring below.
+    approve_syms: list[str] | None = cast("list[str] | None", args.approve)
+
+    if not args.refresh and not args.complete and approve_syms is None \
             and not args.symbol and not args.oracle:
         from .tui import main as tui_main
         return tui_main()
@@ -277,6 +326,11 @@ def main() -> int:
     args.repo, args.target = _autodetect_paths(args.repo, args.target)
 
     signal.signal(signal.SIGTERM, _sigterm_to_cancel)
+
+    # Approving drafts is a pure file operation on work the agent has already
+    # read; the model server has nothing to do with it.
+    if approve_syms is not None:
+        return _record_approval(args.repo, approve_syms)
 
     # A --dry-run staleness scan is pure DB/files: the model server is not
     # part of that contract and must not gate it.
@@ -360,8 +414,9 @@ def main() -> int:
             if errors:
                 print(f"({len(errors)} phase-1 error(s) recorded above — resolve "
                       "them in the drafts before approving)")
-            print("then record approvals:  "
-                  f"echo '[\"{drafts[0]['symbol']}\"]' > {review}/approved.json")
+            print("then record approval (content-bound, after reading them):")
+            print(f"  uv run python -m testbuilder.cli --approve "
+                  f"{' '.join(d['symbol'] for d in drafts)}")
             print("then run again with --complete (add --notes \"...\" to record "
                   "assessment notes in the knowledge base)")
             return 1 if errors else 0
